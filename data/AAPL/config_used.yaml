@@ -1,0 +1,6 @@
+input_stock_path: data/AAPL/aapl_stock.csv
+input_options_path: data/AAPL/aapl_options.csv
+output_dir_name: AAPL
+num_points_to_use: 250000
+num_unhidden_points: 200000
+seed: 42

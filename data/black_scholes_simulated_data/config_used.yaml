@@ -1,0 +1,9 @@
+T: 1.0
+N_SIM: 250000
+R: 0.3
+K: 102.0
+S0: 100.0
+SIGMA_VAL: 0.2
+NUM_UNHIDDEN_POINTS: 150000
+seed: 42
+output_dir_name: black_scholes_simulated_data

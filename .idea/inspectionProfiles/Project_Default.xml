@@ -1,0 +1,27 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="Eslint" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <value>
+          <list size="13">
+            <item index="0" class="java.lang.String" itemvalue="qiskit_ibm_provider" />
+            <item index="1" class="java.lang.String" itemvalue="sklearn" />
+            <item index="2" class="java.lang.String" itemvalue="qiskit-aer-gpu" />
+            <item index="3" class="java.lang.String" itemvalue="qiskit-ibm-runtime" />
+            <item index="4" class="java.lang.String" itemvalue="deepxde" />
+            <item index="5" class="java.lang.String" itemvalue="joblib" />
+            <item index="6" class="java.lang.String" itemvalue="scikit-learn" />
+            <item index="7" class="java.lang.String" itemvalue="matplotlib" />
+            <item index="8" class="java.lang.String" itemvalue="cvxopt" />
+            <item index="9" class="java.lang.String" itemvalue="torch" />
+            <item index="10" class="java.lang.String" itemvalue="qiskit" />
+            <item index="11" class="java.lang.String" itemvalue="numpy" />
+            <item index="12" class="java.lang.String" itemvalue="qiskit-aer" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
