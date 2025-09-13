@@ -1,12 +1,20 @@
 import numpy as np
+import pysindy as ps
 
+from src.utils.sigma_estimation import estimate_constant_sigma, estimate_diffusion_unprocessed
 
 def extract_brownian(assumed_r, S_path, sigma_estimate, dt):
     drift_term = assumed_r * S_path[:-1] * dt
 
+    # If we have sigma values for all time points, then remove the last one
+    # Just like for S_path
+    if not isinstance(sigma_estimate, float):
+        sigma_estimate = sigma_estimate[:-1]
+
     recovered_dB = (np.diff(S_path) - drift_term) / (sigma_estimate * S_path[:-1])
 
     return recovered_dB
+
 
 def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovered_dB, dt, trim_percent=None):
 
@@ -101,3 +109,57 @@ def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovere
                     [f"dB*{name}" for name in Z_candidate_feature_names]
 
     return Theta_matrix, dY, feature_names
+
+
+def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, uniform_t=False, trim_percent=None):
+    """Discovers the PDE using SINDy on the current data history."""
+    u_pred, u_t_pred, u_s_pred, u_ss_pred = derivatives
+
+    # If t is uniform, then make certain assumptions
+    # Else, make other assumptions
+    if uniform_t:
+        dt = t_path[1] - t_path[0]
+        sigma_est = estimate_constant_sigma(s_path, dt)
+        recovered_dB = extract_brownian(assumed_R, s_path, sigma_est, dt)
+
+        t_sindy = dt
+    else:
+        dt = min(np.diff(t_path))
+
+        # Time threshold gets rid of points just before a time skip in the dataset
+        # Necessary for better estimation of Brownian
+        sigma_est = estimate_diffusion_unprocessed(s_path, t_path, time_threshold=dt)
+        recovered_dB = extract_brownian(assumed_R, s_path, sigma_est, dt)
+
+        # Apply masks that get rid of big time jumps
+        valid_indices = np.where(np.diff(t_path) <= dt)[0]
+        s_path = s_path[valid_indices]
+        u_path = u_path[valid_indices]
+        u_t_pred = u_t_pred[valid_indices]
+        u_s_pred = u_s_pred[valid_indices]
+        u_ss_pred = u_ss_pred[valid_indices]
+        # Ensure recovered_dB is 1 element less, required for prepare_theta_matrix
+        recovered_dB = recovered_dB[valid_indices][:-1]
+        t_sindy = t_path[valid_indices]
+
+    # Manually trim t_sindy
+    # This follows exactly what happens in prepare_theta_matrix
+    if trim_percent is not None:
+        trim_size = int(len(u_path) * trim_percent)
+        t_sindy = t_sindy[:trim_size]
+    else:
+        t_sindy = t_sindy[:-1]
+
+    theta_matrix, dy, feature_names = prepare_theta_matrix(
+        s_path, u_path, u_t_pred, u_s_pred, u_ss_pred, recovered_dB, dt, trim_percent=trim_percent
+    )
+
+    sindy_model = ps.SINDy(
+        optimizer=ps.STLSQ(threshold=0, alpha=0, normalize_columns=True),
+        feature_library=ps.IdentityLibrary(),
+        feature_names=feature_names
+    )
+
+    sindy_model.fit(theta_matrix, x_dot=dy, t=t_sindy)
+
+    return sindy_model

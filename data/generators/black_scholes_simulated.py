@@ -185,7 +185,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="default_black_scholes",
+        default="black_scholes",
         help="Config file name in configs/generators/ (without .yaml extension)"
     )
     parser.add_argument(

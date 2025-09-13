@@ -16,7 +16,7 @@ from src.utils.common import apply_overrides
 from src.utils.data_processing import prepare_dataset_for_model, build_library
 from src.utils.model import prepare_model
 from src.utils.sigma_estimation import estimate_constant_sigma, estimate_diffusion_unprocessed
-from src.utils.sindy import extract_brownian, prepare_theta_matrix
+from src.utils.sindy import discover_equation, extract_brownian, prepare_theta_matrix
 from src.utils.training import make_closure
 from src.utils.true_greeks import black_scholes_partial_t, black_scholes_partial_x, black_scholes_partial_xx
 
@@ -44,17 +44,10 @@ class Config:
     w_l1: float = 0.0
 
     # Optimizer
-    pretrain_epochs: int = 100  # No physics loss for first pretrain_epochs
-    anneal_epochs: int = 100
     max_eval: int = 3_000
     patience: int = 3
 
     display_every: int = 100
-
-    # Adam pre-training hyperparameters
-    use_adam: bool = True
-    adam_epochs: int = 8000
-    adam_lr: float = 1e-3
 
     # Reproducibility
     seed: int = 42
@@ -81,19 +74,9 @@ class PINNTrainer:
         # Load and process data
         self.s_train, self.t_train, self.u_train = self._load_data()
 
-        # Normalization step
-        self.s_scaler = MinMaxScaler(feature_range=(-1, 1))
-        self.t_scaler = MinMaxScaler(feature_range=(-1, 1))
-
-        s_train_normalized = self.s_scaler.fit_transform(self.s_train.reshape(-1, 1))
-        t_train_normalized = self.t_scaler.fit_transform(self.t_train.reshape(-1, 1))
-
-        s_train_normalized = s_train_normalized.flatten()
-        t_train_normalized = t_train_normalized.flatten()
-
         # Use normalized data for training
         self.x_u_train_t, self.x_f_train_t, self.u_train_t = prepare_dataset_for_model(
-            self.config.N_u, self.config.N_f, s_train_normalized, t_train_normalized, self.u_train, self.device
+            self.config.N_u, self.config.N_f, self.s_train, self.t_train, self.u_train, self.device
         )
 
         # Prepare model and optimizer
@@ -123,7 +106,7 @@ class PINNTrainer:
         self._sindy_eq()
 
         # Save artifacts
-        # self._save_artifacts()
+        self._save_artifacts()
 
     def _load_data(self) -> (np.ndarray, np.ndarray, np.ndarray):
         """Loads the training data from the .npz file specified in the config."""
@@ -171,7 +154,7 @@ class PINNTrainer:
         return net_u, xi, optimizer
 
     def _train_model(self):
-        """Performs the training loop."""
+        """Performs the training loop. This function exists to account for more complex training steps."""
         self._train_lbfgs()
 
     def _train_lbfgs(self):
@@ -181,7 +164,7 @@ class PINNTrainer:
 
         # The L-BFGS optimizer requires a "closure" function
         closure = make_closure(self.net_u, self.optimizer, self.x_u_train_t, self.x_f_train_t, self.u_train_t, self.xi,
-                               self.config, plotting_func=self._visualize_solution)
+                               self.config)
 
         # Training loop
         try:
@@ -248,55 +231,42 @@ class PINNTrainer:
     def _sindy_eq(self):
         logging.info("Performing SINDy step")
 
-        u_pred, u_t_pred, u_S_pred, u_SS_pred = self._get_current_derivatives()
+        u_pred, u_t_pred, u_s_pred, u_ss_pred = self._get_current_derivatives()
 
+        # If Black-Scholes simulated data, set simulated R to what was actually used in the simulation
         if self.config.data_dir == "black_scholes_simulated_data":
             assumed_R = self.bs_data_config['R']
         else:
             assumed_R = 0.1
 
-        s_sindy = self.s_train
-        u_sindy = self.u_train
-        t_sindy = self.t_train
+        # 1. With no trimming
+        logging.info("Equation with no trimming")
+        # Discover equation
+        sindy_model = discover_equation(
+            s_path=self.s_train,
+            u_path=self.u_train,
+            t_path=self.t_train,
+            derivatives=(u_pred, u_t_pred, u_s_pred, u_ss_pred),
+            assumed_R=assumed_R,
+            uniform_t=self.config.uniform_t,
+            trim_percent=None
+        )
+        sindy_model.print(lhs=["dY"])
 
-        if self.config.uniform_t:
-            dt = self.t_train[1] - self.t_train[0]
-            sigma_est = estimate_constant_sigma(self.s_train, dt)
-            recovered_dB = extract_brownian(assumed_R, self.s_train, sigma_est, dt)
-
-            t_sindy = dt
-        else:
-            dt = min(np.diff(self.t_train))
-
-            # Time threshold gets rid of points just before a time skip in the dataset
-            # Necessary for better estimation of Brownian
-            sigma_est = estimate_diffusion_unprocessed(self.s_train, self.t_train, time_threshold=dt)
-            recovered_dB = extract_brownian(assumed_R, self.s_train, sigma_est, dt)
-
-            # Apply masks that get rid of big time jumps
-            valid_indices = np.where(dt <= dt)[0]
-            s_sindy = s_sindy[valid_indices]
-            u_sindy = u_sindy[valid_indices]
-            u_t_pred = u_t_pred[valid_indices]
-            u_S_pred = u_S_pred[valid_indices]
-            u_SS_pred = u_SS_pred[valid_indices]
-            # Ensure recovered_dB is 1 element less, required for prepare_theta_matrix
-            recovered_dB = recovered_dB[valid_indices][:-1]
-            t_sindy = t_sindy[valid_indices]
-
-        theta_matrix, dy, feature_names = prepare_theta_matrix(
-            s_sindy, u_sindy, u_t_pred, u_S_pred, u_SS_pred, recovered_dB, dt, trim_percent=0.8
+        # 1. With 0.8 trimming
+        logging.info("Equation with 0.8 trimming")
+        # Discover equation
+        sindy_model = discover_equation(
+            s_path=self.s_train,
+            u_path=self.u_train,
+            t_path=self.t_train,
+            derivatives=(u_pred, u_t_pred, u_s_pred, u_ss_pred),
+            assumed_R=assumed_R,
+            uniform_t=self.config.uniform_t,
+            trim_percent=0.8
         )
 
-        model = ps.SINDy(
-            optimizer=ps.STLSQ(threshold=0, alpha=0, normalize_columns=True),
-            feature_library=ps.IdentityLibrary(),
-            feature_names=feature_names
-        )
-
-        model.fit(theta_matrix, x_dot=dy, t=t_sindy)
-
-        model.print(lhs=["dY"])
+        sindy_model.print(lhs=["dY"])
 
     def _get_current_derivatives(self):
         x_path = np.hstack((self.s_train.reshape(-1, 1), self.t_train.reshape(-1, 1)))
@@ -316,8 +286,6 @@ class PINNTrainer:
         with open(self.output_dir / "config_used.yaml", "w") as f:
             yaml.dump(asdict(self.config), f)
 
-        logging.info(f"Saved model and artifacts to {self.output_dir}")
-
     def _evaluate_on_test_data(self):
         """Loads the test data and evaluates the trained model's performance."""
         logging.info("Evaluating model on the test dataset...")
@@ -329,14 +297,7 @@ class PINNTrainer:
 
         # Load test data
         data = np.load(test_data_path)
-        s_test_raw, t_test_raw, u_test = data['S_PATH'], data['T_PATH'], data['U_PATH']
-
-        # Normalization step
-        s_test = self.s_scaler.transform(s_test_raw.reshape(-1, 1))
-        t_test = self.t_scaler.transform(t_test_raw.reshape(-1, 1))
-
-        s_test = s_test.flatten()
-        t_test = t_test.flatten()
+        s_test, t_test, u_test = data['S_PATH'], data['T_PATH'], data['U_PATH']
 
         # Prepare input tensor for the model
         x_test_t = torch.from_numpy(
@@ -372,71 +333,6 @@ class PINNTrainer:
         plt.savefig(save_path)
         logging.info(f"Saved test evaluation plot to {save_path}")
         plt.close()
-
-    def _train_adam(self):
-        """Performs the Adam pre-training stage."""
-        logging.info(f"Starting Adam training for {self.config.adam_epochs} epochs...")
-        start_time = time()
-
-        # Setup Adam optimizer
-        adam_optimizer = torch.optim.Adam(
-            list(self.net_u.parameters()),
-            lr=self.config.adam_lr
-        )
-        loss_data_fn = torch.nn.MSELoss()
-
-        for epoch in range(1, self.config.adam_epochs + 1):
-            adam_optimizer.zero_grad()
-
-            # --- Loss Calculation ---
-            # Data loss
-            u_pred_data = self.net_u(self.x_u_train_t)
-            loss_data = loss_data_fn(u_pred_data, self.u_train_t)
-
-            # Total loss
-            loss_total = self.config.w_data * loss_data
-
-            loss_total.backward()
-            adam_optimizer.step()
-
-            if epoch % self.config.display_every == 0:
-                logging.info(
-                    f"Epoch: {epoch} | "
-                    f"Total Loss (only data): {loss_total.item():.6f}, "
-                )
-
-        duration = time() - start_time
-        logging.info(f"Adam training finished in {duration:.2f} seconds.")
-
-    def _visualize_solution(self, eval_counter):
-        """Plots the learned solution surface u(S, t)."""
-        s_grid = np.linspace(self.s_train.min(), self.s_train.max(), 100)
-        t_grid = np.linspace(self.t_train.min(), self.t_train.max(), 100)
-        S, T = np.meshgrid(s_grid, t_grid)
-
-        # Normalize the grid points using the same scalers
-        S_norm = self.s_scaler.transform(S.flatten().reshape(-1, 1))
-        T_norm = self.t_scaler.transform(T.flatten().reshape(-1, 1))
-
-        x_grid_t = torch.from_numpy(np.hstack((S_norm, T_norm))).double().to(self.device)
-
-        self.net_u.eval()
-        with torch.no_grad():
-            U_pred = self.net_u(x_grid_t).cpu().numpy().reshape(S.shape)
-        self.net_u.train()  # Set back to train mode
-
-        fig = plt.figure(figsize=(10, 7))
-        ax = fig.add_subplot(111, projection='3d')
-        ax.plot_surface(S, T, U_pred, cmap='viridis')
-        ax.set_xlabel('Stock Price (S)')
-        ax.set_ylabel('Time (t)')
-        ax.set_zlabel('Option Price (u)')
-        ax.set_title(f'Learned Solution Surface at Evaluation: {eval_counter}')
-
-        save_path = self.output_dir / f"solution_surface_eval_{eval_counter + 1}.png"
-        plt.savefig(save_path)
-        logging.info(f"Saved debug plot to {save_path}")
-        plt.close(fig)
 
 
 # --- Main Entry Point ---

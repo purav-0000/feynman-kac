@@ -33,7 +33,6 @@ def prepare_data(S_path, t_path, time_threshold=5.0):
     """
     Prepares time-series data for diffusion estimation by filtering out large time gaps.
     """
-    logging.info("Preparing data and filtering time gaps...")
     dt = np.diff(t_path)
     dS = np.diff(S_path)
 
@@ -41,7 +40,6 @@ def prepare_data(S_path, t_path, time_threshold=5.0):
 
     num_total = len(dt)
     num_valid = len(valid_indices)
-    logging.info(f"Filtered {num_total - num_valid} of {num_total} increments due to time gaps.")
 
     S_path_filtered = S_path[valid_indices]
     dS_filtered = dS[valid_indices]
@@ -88,10 +86,9 @@ def estimate_diffusion_unprocessed(S_path, t_path, time_threshold=5.0, bandwidth
     # Step 2: Call the core estimation function with the cleaned data
     S_grid, sigma_on_grid = estimate_diffusion_fft(S_path_clean, dS_sq_per_dt_clean, bandwidth, n_grid)
 
-    logging.info("Interpolating sigma values back onto the original time path...")
     sigma_at_each_time = np.interp(S_path, S_grid, sigma_on_grid)
 
-    return S_grid, sigma_on_grid, sigma_at_each_time
+    return sigma_at_each_time
 
 
 # --- SINDy MODEL TRAINING ---

@@ -1,0 +1,22 @@
+# Data options
+data_dir: "AAPL"
+uniform_t: False
+
+# Data hyperparameters
+N_u: 400000
+N_f: 150000
+
+# Model hyperparameters
+layers: [2, 32, 32, 32, 32, 32, 32, 1]  # If passed as override, enter as 2,32,32,32,32,32,32,1
+
+# Training hyperparameters
+# Loss function weights
+w_data: 1.0
+w_physics: 1.0
+w_l1: 0.0001 # 1e-4
+
+# Optimizer
+max_eval: 3_000
+patience: 3
+
+display_every: 100

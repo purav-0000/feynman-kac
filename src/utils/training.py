@@ -9,7 +9,7 @@ class EarlyStoppingException(Exception):
     pass
 
 
-def make_closure(net_u, optimizer, X_u_train_t, X_f_train_t, u_train_t, xi, cfg, pbar=None, plotting_func=None):
+def make_closure(net_u, optimizer, X_u_train_t, X_f_train_t, u_train_t, xi, cfg, pbar=None):
     loss_data_fn = torch.nn.MSELoss()
     eval_counter = 0
     best_loss = float('inf')
@@ -54,10 +54,7 @@ def make_closure(net_u, optimizer, X_u_train_t, X_f_train_t, u_train_t, xi, cfg,
             else:
                 print(message)
 
-            if plotting_func is not None:
-                plotting_func(eval_counter=eval_counter)
-
-            # Only consider after pretraining
+            # Patience implementation
             if loss_total.item() < best_loss - 1e-8:
                 best_loss = loss_total.item()
                 patience_counter = 0

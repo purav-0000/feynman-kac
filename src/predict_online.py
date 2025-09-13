@@ -15,7 +15,8 @@ from tqdm import tqdm
 from src.utils.common import apply_overrides
 from src.utils.data_processing import prepare_dataset_for_model
 from src.utils.model import load_model_and_xi
-from src.utils.sindy import estimate_constant_sigma, extract_brownian, prepare_theta_matrix
+from src.utils.sigma_estimation import estimate_constant_sigma, estimate_diffusion_unprocessed
+from src.utils.sindy import discover_equation, extract_brownian, prepare_theta_matrix
 from src.utils.training import make_closure
 
 
@@ -28,6 +29,9 @@ class Config:
     # Directories
     data_dir: str = "black_scholes_simulated_data"
     model_dir: str = "run_?"  # Path to the trained model directory
+
+    # Data options
+    uniform_t: bool = True
 
     # Prediction & Update Control
     prediction_horizon: int = 1  # How many steps to predict into the future at each iteration.
@@ -108,7 +112,11 @@ class OnlinePredictor:
 
         self.s_total = np.concatenate([unhidden_data['S_PATH'], hidden_data['S_PATH']])
         self.t_total = np.concatenate([unhidden_data['T_PATH'], hidden_data['T_PATH']])
-        self.dt = self.t_total[1] - self.t_total[0]
+
+        if self.config.uniform_t:
+            self.dt = self.t_total[1] - self.t_total[0]
+        else:   # Assuming that there is one standard time skip and it is the smallest
+            self.dt = min(np.diff(self.t_total))
         self.u_total = np.concatenate([unhidden_data['U_PATH'], hidden_data['U_PATH']])
         self.num_unhidden = len(unhidden_data['S_PATH'])
 
@@ -125,21 +133,22 @@ class OnlinePredictor:
 
         u_pred, u_t_pred, u_s_pred, u_ss_pred = self.net_u.get_derivatives(inputs_t)
 
-        sigma_est = estimate_constant_sigma(self.s_history, self.dt)
-        recovered_dB = extract_brownian(assumed_r=self.bs_data_config['R'], S_path=self.s_history,
-                                        sigma_estimate=sigma_est, dt=self.dt)
+        # If Black-Scholes simulated data, set simulated R to what was actually used in the simulation
+        if self.config.data_dir == "black_scholes_simulated_data":
+            assumed_R = self.bs_data_config['R']
+        else:
+            assumed_R = 0.1
 
-        theta_matrix, dy, feature_names = prepare_theta_matrix(
-            self.s_history, self.u_history, u_t_pred, u_s_pred, u_ss_pred, recovered_dB, self.dt, trim_percent=None
+        # Discover equation
+        sindy_model = discover_equation(
+            s_path=self.s_history,
+            u_path=self.u_history,
+            t_path=self.t_history,
+            derivatives=(u_pred, u_t_pred, u_s_pred, u_ss_pred),
+            assumed_R=assumed_R,
+            uniform_t=self.config.uniform_t,
+            trim_percent=None
         )
-
-        sindy_model = ps.SINDy(
-            optimizer=ps.STLSQ(threshold=0, alpha=0, normalize_columns=True),
-            feature_library=ps.IdentityLibrary(),
-            feature_names=feature_names
-        )
-
-        sindy_model.fit(theta_matrix, x_dot=dy, t=self.dt)
 
         return sindy_model
 
@@ -184,7 +193,7 @@ class OnlinePredictor:
         predictions = last_known_u + np.cumsum(increments)
         return list(predictions)
 
-    def _predict_intervals(self, sindy_model):
+    def _predict_intervals(self, sindy_model, recovered_dB, bounds):
 
         inputs = np.hstack((self.s_history[-1].reshape(-1, 1), self.t_history[-1].reshape(-1, 1)))
         inputs_t = torch.from_numpy(inputs).double().to(self.device).requires_grad_(True)
@@ -203,10 +212,9 @@ class OnlinePredictor:
         u_s_pred = torch.cat([u_s_pred, zero_array])
         u_ss_pred = torch.cat([u_ss_pred, zero_array])
 
-        # Set recovered dB to 0 since that is the mean prediction
-        recovered_dB = np.zeros(1)
 
-        # u_pred is passed but not utilized
+
+        # u_theta is passed but not utilized
         theta_matrix, _, _ = prepare_theta_matrix(
             s_theta, u_theta, u_t_pred, u_s_pred, u_ss_pred, recovered_dB, self.dt, trim_percent=None
         )
@@ -217,6 +225,7 @@ class OnlinePredictor:
         last_known_u = self.u_history[-1]
         predictions = last_known_u + np.cumsum(increments)
 
+        """
         # Now we calculate the bounds
         # Calculate alpha (total tail probability)
         alpha = 1 - self.config.confidence_level
@@ -229,13 +238,12 @@ class OnlinePredictor:
         z_score = scipy.stats.norm.ppf(cumulative_prob)
 
         # Mean of 0, std of np.sqrt(dt)
-        dt = self.t_history[1] - self.t_history[0]
-        bound = 0 + z_score * np.sqrt(dt)
+        bound = 0 + z_score * np.sqrt(self.dt)
         bounds = [-abs(bound), abs(bound)]
-
+        """
         upper_bound_pred, lower_bound_pred = None, None
         for bound in bounds:
-            # Set recovered dB to 0 since that is the mean prediction
+            # Set recovered dB to mean prediction
             recovered_dB = bound
 
             # u_pred is passed but not utilized
@@ -247,7 +255,8 @@ class OnlinePredictor:
             increments = theta_matrix @ coeffs
 
             last_known_u = self.u_history[-1]
-            if bound < 0:
+
+            if bound == min(bounds):
                 lower_bound_pred = last_known_u + np.cumsum(increments)
             else:
                 upper_bound_pred = last_known_u + np.cumsum(increments)
@@ -321,6 +330,11 @@ class OnlinePredictor:
         steps_since_last_sindy_update = 0
         steps_since_last_nn_update = 0
         sindy_model = None  # This will hold the "cached" SINDy model
+        recovered_dB = None # This will hold the "cached" Brownian motion
+        bounds = None       # This will hold the "cached" bounds for interval prediction
+
+        # Store minimum dt to skip predictions over time skips
+        dt = min(np.diff(self.t_total))
 
         while current_idx < len(self.s_total) - 1:
             # Determine the number of steps for this prediction cycle based on the horizon
@@ -331,17 +345,42 @@ class OnlinePredictor:
             # Step 1: Discover/update the SINDy model only when scheduled
             if sindy_model is None or steps_since_last_sindy_update >= self.config.sindy_update_every:
                 sindy_model = self._discover_equation()
+
+                # Cache Brownian motion
+                sigma_est = estimate_diffusion_unprocessed(self.s_history, self.t_history, time_threshold=self.dt)
+                assumed_R = 0.1
+                recovered_dB = extract_brownian(assumed_R, self.s_history, sigma_est, self.dt)
+
+                # Apply mask that get rid of big time jumps
+                valid_indices = np.where(np.diff(self.t_history) <= self.dt)[0]
+                recovered_dB = recovered_dB[valid_indices]
+
+                # Calculate the lower and upper percentiles required for the confidence interval
+                alpha = 1 - self.config.confidence_level  # e.g., 1 - 0.95 = 0.05
+                lower_percentile = (alpha / 2) * 100  # e.g., 2.5
+                upper_percentile = (1 - alpha / 2) * 100  # e.g., 97.5
+
+                # Use numpy.percentile to find the actual values from your historical data
+                bounds = np.percentile(recovered_dB, [lower_percentile, upper_percentile])
+
                 steps_since_last_sindy_update = 0  # Reset counter
 
             # Step 2: Predict the next `num_steps` using the current SINDy model
+            # If there is a time skip after this point, ignore
             if self.config.calculate_intervals:
-                predictions = self._predict_intervals(sindy_model)
+                if self.t_total[current_idx + 1] - self.t_history[-1] <= dt:
+                    predictions = self._predict_intervals(sindy_model, np.mean(recovered_dB), bounds)
 
-                # Returns mean, lower bound, upper bound
-                predicted_u_path.extend(predictions[0])
-                lower_bound_path.extend(predictions[1])
-                upper_bound_path.extend(predictions[2])
-            else:
+                    # Returns mean, lower bound, upper bound
+                    predicted_u_path.extend(predictions[0])
+                    lower_bound_path.extend(predictions[1])
+                    upper_bound_path.extend(predictions[2])
+                else:
+                    # This ignores the time skip
+                    predicted_u_path.extend([self.u_total[current_idx + 1]])
+                    lower_bound_path.extend([self.u_total[current_idx + 1]])
+                    upper_bound_path.extend([self.u_total[current_idx + 1]])
+            else:   # !!! IGNORING TIME SKIP NOT IMPLEMENTED FOR THE ELSE BLOCK BELOW
                 predictions = self._predict_next_steps(sindy_model, current_idx, num_steps)
                 predicted_u_path.extend(predictions)
 
@@ -350,12 +389,16 @@ class OnlinePredictor:
 
             # Step 4: Increment counters and check for model updates
             steps_since_last_sindy_update += num_steps
+
+            # TEMP: IGNORE NEURAL NETWORK UPDATES FOR NOW
+            """
             steps_since_last_nn_update += num_steps
 
             if (steps_since_last_nn_update >= self.config.nn_update_every and
                     current_idx + num_steps < len(self.s_total) - 1):  # Check against the end
                 self._update_neural_net()
                 steps_since_last_nn_update = 0  # Reset counter
+            """
 
             # Advance the main index and progress bar
             current_idx += num_steps
@@ -383,6 +426,9 @@ class OnlinePredictor:
         save_path = save_dir / "online_prediction_vs_truth.png"
 
         plt.figure(figsize=(15, 7))
+
+        # Forcing limits for now
+        plt.ylim(59.0, 62.0)
 
         # Plot the full ground truth path
         plt.plot(t_path[self.num_unhidden - 1:], true_u_path[self.num_unhidden - 1:], label='Ground Truth', color='black', linewidth=2, zorder=2)
@@ -430,7 +476,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="default_online",
+        default="black_scholes_online",
         help="Config file name in configs/prediction/ (without .yaml extension)"
     )
     parser.add_argument("--overrides", nargs='*', help="...")

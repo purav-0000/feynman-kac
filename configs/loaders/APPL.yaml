@@ -9,11 +9,11 @@ output_dir_name: "AAPL"
 # --- Data Processing Hyperparameters ---
 # Total number of data points to use from the END of the dataset.
 # Use -1 to load all available data points.
-num_points_to_use: 250000
+num_points_to_use: 500000
 
 # The number of points from the selected data to keep visible (unhidden).
 # The rest will be considered hidden data for prediction/testing.
-num_unhidden_points: 200000
+num_unhidden_points: 450000
 
 # --- Reproducibility ---
 seed: 42
