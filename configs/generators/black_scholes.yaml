@@ -1,13 +1,13 @@
 # Simulation hyperparameters
 T: 1.0
-N_SIM: 250000
+N_SIM: 500000
 R: 0.3
 K: 102.0
 S0: 100.0
 SIGMA_VAL: 0.2
 
 # Data split point
-NUM_UNHIDDEN_POINTS: 150000
+NUM_UNHIDDEN_POINTS: 400000
 
 # Reproducibility
 seed: 42

@@ -11,7 +11,7 @@ layers:
 - 32
 - 32
 - 1
-max_eval: 5000
+max_eval: 3000
 patience: 3
 seed: 42
 uniform_t: false

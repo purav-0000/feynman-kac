@@ -1,7 +1,11 @@
+import logging
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pysindy as ps
 
 from src.utils.sigma_estimation import estimate_constant_sigma, estimate_diffusion_unprocessed
+
 
 def extract_brownian(assumed_r, S_path, sigma_estimate, dt):
     drift_term = assumed_r * S_path[:-1] * dt
@@ -11,9 +15,37 @@ def extract_brownian(assumed_r, S_path, sigma_estimate, dt):
     if not isinstance(sigma_estimate, float):
         sigma_estimate = sigma_estimate[:-1]
 
-    recovered_dB = (np.diff(S_path) - drift_term) / (sigma_estimate * S_path[:-1])
+    # If sigma is constant and not a function
+    if isinstance(sigma_estimate, float):
+        recovered_dB = (np.diff(S_path) - drift_term) / (sigma_estimate * S_path[:-1])
+    else:
+        recovered_dB = (np.diff(S_path) - drift_term) / (sigma_estimate)
 
     return recovered_dB
+
+
+def save_updated_brownian(recovered_dB, dt, model_dir):
+    plt.figure(figsize=(12, 4))
+    plt.plot(
+        recovered_dB,
+        color="tab:blue",
+        linewidth=1.2,
+        alpha=0.9,
+        label="Recovered dB"
+    )
+    plt.axhline(0, color="black", linestyle="--", linewidth=0.8, alpha=0.7)
+    plt.title("Recovered Brownian Motion", fontsize=14, fontweight="bold")
+    plt.xlabel("Time Step", fontsize=12)
+    plt.ylabel("Increment", fontsize=12)
+    plt.grid(True, linestyle="--", linewidth=0.6, alpha=0.7)
+    plt.legend(frameon=False)
+    plt.title(f"Mean: {np.mean(recovered_dB):.3e}, Std: {np.std(recovered_dB):.3e} (sqrt(dt): {np.sqrt(dt):.3e})")
+    plt.tight_layout()
+    plt.savefig(
+        f"{model_dir}/recovered_brownian_motion.png",
+        bbox_inches="tight",
+        dpi=300
+    )
 
 
 def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovered_dB, dt, trim_percent=None):
@@ -48,27 +80,44 @@ def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovere
     else:
         dY = np.diff(u_path)
 
-    # --- Commented out the old Black-Scholes specific library ---
-    # The original library was hard-coded for a Black-Scholes like structure.
-    # It assumed f was a combination of u_t, X*u_x, and X^2*u_xx,
-    # and Z was solely X*u_x.
-    #
-    # rate_term = S_path_sindy * u_s_sindy
-    # f_candidate_terms_matrix = np.vstack([
-    #     u_t_sindy,
-    #     rate_term,
-    #     S_path_sindy ** 2 * u_ss_sindy,
-    # ]).T
-    # Z_candidate_terms_matrix = np.vstack([
-    #     S_path_sindy * u_s_sindy
-    # ]).T
-    # f_candidate_feature_names = ["u_t", "X * u_x", "X^2 * u_xx"]
-    # Z_candidate_feature_names = ["X * u_x"]
+    """
+    # --- Black-Scholes specific library ---
+    rate_term = S_path_sindy * u_s_sindy
+    f_candidate_terms_matrix = np.vstack([
+        u_t_sindy,
+        rate_term,
+        S_path_sindy ** 2 * u_ss_sindy,
+    ]).T
+    Z_candidate_terms_matrix = np.vstack([
+        S_path_sindy * u_s_sindy
+    ]).T
+    f_candidate_feature_names = ["u_t", "X * u_x", "X^2 * u_xx"]
+    Z_candidate_feature_names = ["X * u_x"]
+    """
 
-    # --- New, Flexible Library for General BSDE Discovery ---
-    # This library includes a wider range of candidate terms to discover
-    # the drift (f) and diffusion (Z) terms for potentially non-BS models.
+    """
+    # --- Slightly more flexible library (SINDy test) ---
+    rate_term = S_path_sindy * u_s_sindy
+    f_candidate_terms_matrix = np.vstack([
+        u_t_sindy,
+        rate_term,
+        S_path_sindy ** 2 * u_ss_sindy,
 
+        # Noisy terms for BS
+        # np.ones_like(S_path_sindy),
+        S_path_sindy ** 3,
+        u_path_sindy ** 2,
+        S_path_sindy * u_path_sindy ** 2
+    ]).T
+    Z_candidate_terms_matrix = np.vstack([
+        S_path_sindy * u_s_sindy,
+    ]).T
+    f_candidate_feature_names = ["u_t", "X * u_x", "X^2 * u_xx", "X^3", "u^2", "X * u^2"]
+    Z_candidate_feature_names = ["X * u_x", "X", "u"]
+    """
+
+
+    # --- Flexible Library ---
     # Candidate terms for the drift part, f(t, X, u, u_x, u_xx)
     f_candidate_terms_matrix = np.vstack([
         np.ones_like(S_path_sindy),  # Bias/constant term
@@ -111,7 +160,8 @@ def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovere
     return Theta_matrix, dY, feature_names
 
 
-def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, uniform_t=False, trim_percent=None):
+def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, uniform_t=False, trim_percent=None,
+                      save_dir_Brownian=None):
     """Discovers the PDE using SINDy on the current data history."""
     u_pred, u_t_pred, u_s_pred, u_ss_pred = derivatives
 
@@ -128,7 +178,8 @@ def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, unifor
 
         # Time threshold gets rid of points just before a time skip in the dataset
         # Necessary for better estimation of Brownian
-        sigma_est = estimate_diffusion_unprocessed(s_path, t_path, time_threshold=dt)
+        s_grid, sigma_on_grid = estimate_diffusion_unprocessed(s_path, t_path, time_threshold=dt)
+        sigma_est = np.interp(s_path, s_grid, sigma_on_grid)
         recovered_dB = extract_brownian(assumed_R, s_path, sigma_est, dt)
 
         # Apply masks that get rid of big time jumps
@@ -142,24 +193,41 @@ def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, unifor
         recovered_dB = recovered_dB[valid_indices][:-1]
         t_sindy = t_path[valid_indices]
 
+    if save_dir_Brownian is not None:
+        save_updated_brownian(recovered_dB, dt, save_dir_Brownian)
+
     # Manually trim t_sindy
     # This follows exactly what happens in prepare_theta_matrix
-    if trim_percent is not None:
-        trim_size = int(len(u_path) * trim_percent)
-        t_sindy = t_sindy[:trim_size]
-    else:
-        t_sindy = t_sindy[:-1]
+    if not uniform_t:   # If t_sindy is not dt
+        if trim_percent is not None:
+            trim_size = int(len(u_path) * trim_percent)
+            t_sindy = t_sindy[:trim_size]
+        else:
+            t_sindy = t_sindy[:-1]
 
     theta_matrix, dy, feature_names = prepare_theta_matrix(
         s_path, u_path, u_t_pred, u_s_pred, u_ss_pred, recovered_dB, dt, trim_percent=trim_percent
     )
 
+    optimizer_lin_reg = ps.STLSQ(threshold=0, alpha=0, normalize_columns=True)
+    optimizer_STLSQ = ps.STLSQ(threshold=1e-3, alpha=1e+3, normalize_columns=True)
+    optimizer_SR3 = ps.SR3(reg_weight_lam=1e+1, regularizer='L2', max_iter=1000, normalize_columns=True)
+
     sindy_model = ps.SINDy(
-        optimizer=ps.STLSQ(threshold=0, alpha=0, normalize_columns=True),
+        optimizer=optimizer_SR3,
         feature_library=ps.IdentityLibrary(),
-        feature_names=feature_names
     )
 
-    sindy_model.fit(theta_matrix, x_dot=dy, t=t_sindy)
+    # Stats for debugging
+    """
+    print(f"dy stats: mean={np.mean(dy):.3e}, std={np.std(dy):.3e}" )
+    for i in range(theta_matrix.shape[1]):
+        print(f"Theta col {i} stats: mean={np.mean(theta_matrix[:, i]):.3e}, std={np.std(theta_matrix[:, i]):.3e}")
+    """
+
+    sindy_model.fit(theta_matrix, x_dot=dy.reshape(-1, 1), t=t_sindy, feature_names=feature_names)
+
+    # Score for debugging
+    # print(sindy_model.score(x=theta_matrix, x_dot=dy.reshape(-1, 1), t=t_sindy))
 
     return sindy_model

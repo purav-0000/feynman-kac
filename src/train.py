@@ -14,7 +14,7 @@ import yaml
 
 from src.utils.common import apply_overrides
 from src.utils.data_processing import prepare_dataset_for_model, build_library
-from src.utils.model import prepare_model
+from src.utils.model import load_model_and_xi, prepare_model
 from src.utils.sigma_estimation import estimate_constant_sigma, estimate_diffusion_unprocessed
 from src.utils.sindy import discover_equation, extract_brownian, prepare_theta_matrix
 from src.utils.training import make_closure
@@ -95,12 +95,16 @@ class PINNTrainer:
         """Main execution method to start the training process."""
         # Train the model
         self._train_model()
+        # When experimenting
+        # self._load_models()
+
 
         # Check derivatives if using Black-Scholes model
         if self.config.data_dir == "black_scholes_simulated_data":
             self._check_derivatives()
         else:
             self._evaluate_on_test_data()
+
 
         # SINDy step
         self._sindy_eq()
@@ -249,10 +253,12 @@ class PINNTrainer:
             derivatives=(u_pred, u_t_pred, u_s_pred, u_ss_pred),
             assumed_R=assumed_R,
             uniform_t=self.config.uniform_t,
-            trim_percent=None
+            trim_percent=None,
+            save_dir_Brownian=self.output_dir
         )
         sindy_model.print(lhs=["dY"])
 
+        """
         # 1. With 0.8 trimming
         logging.info("Equation with 0.8 trimming")
         # Discover equation
@@ -265,8 +271,9 @@ class PINNTrainer:
             uniform_t=self.config.uniform_t,
             trim_percent=0.8
         )
-
         sindy_model.print(lhs=["dY"])
+        """
+
 
     def _get_current_derivatives(self):
         x_path = np.hstack((self.s_train.reshape(-1, 1), self.t_train.reshape(-1, 1)))
@@ -334,6 +341,24 @@ class PINNTrainer:
         logging.info(f"Saved test evaluation plot to {save_path}")
         plt.close()
 
+    # --- METHODS NEEDED WHEN EXPERIMENTING ---
+    def _load_models(self):
+        """Loads the pre-trained neural network and xi parameter."""
+        logging.info(f"Loading pre-trained model")
+
+        self.net_u, self.xi = load_model_and_xi("models" / Path("AAPL_sample"), self.device)
+
+        # Initialize model bounds
+        S_min, S_max = self.s_train.min(), self.s_train.max()
+        t_min, t_max = self.t_train.min(), self.t_train.max()
+
+        # For normalization
+        lb = torch.tensor([S_min, t_min], device=self.device, dtype=torch.double)
+        ub = torch.tensor([S_max, t_max], device=self.device, dtype=torch.double)
+
+        self.net_u.lower_bound = lb
+        self.net_u.upper_bound = ub
+
 
 # --- Main Entry Point ---
 
@@ -342,7 +367,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="default",
+        default="black_scholes",
         help="Config file name in configs/training/ (without .yaml extension)"
     )
     parser.add_argument("--overrides", nargs='*', help="...")

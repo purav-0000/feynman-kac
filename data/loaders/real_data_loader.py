@@ -23,7 +23,9 @@ class Config:
 
     # Data processing hyperparameters
     num_points_to_use: int
+    sample_every: int
     num_unhidden_points: int
+    maturity_time: int
 
     # Reproducibility
     seed: int
@@ -126,20 +128,44 @@ class DataLoader:
         stock_dt, stock_mid = _load_and_clean_file(self.config.input_stock_path)
         option_dt, option_mid = _load_and_clean_file(self.config.input_options_path)
 
-        # --- Convert time to seconds from the start of the series ---
-        if len(stock_dt) > 0:
-            t0 = stock_dt[0]
-            stock_time_seconds = np.array([(t - t0).total_seconds() for t in stock_dt])
-            option_time_seconds = np.array([(t - t0).total_seconds() for t in option_dt])
-        else:
-            stock_time_seconds = np.array([])
-            option_time_seconds = np.array([])
+        # --- Scale time based on duration, ending at maturity ---
+        # Determine the absolute start and end times of the entire dataset
+        # ASSUMING STOCK AND OPTIONS HAVE SAME TIME AXIS
+        t_start = stock_dt[0]
+        t_end = stock_dt[-1]
 
-        # Basic alignment check
-        if len(stock_time_seconds) != len(option_time_seconds):
-            logging.warning("Stock and Option data have different lengths. This might cause issues.")
+        # Calculate the total duration of the dataset
+        duration_sec = (t_end - t_start).total_seconds()
 
-        return stock_time_seconds, stock_mid, option_time_seconds, option_mid
+        # Define seconds in a year for accurate conversion
+        seconds_in_year = 365 * 24 * 60 * 60
+        duration_years = duration_sec / seconds_in_year
+
+        # The last data point corresponds to the maturity time T
+        T_maturity = self.config.maturity_time
+        # The start time of our scaled series is T minus the data's duration in years
+        T_start = T_maturity - duration_years
+
+        logging.info(
+            f"Dataset duration is {duration_years:.4f} years. Scaling time to the interval [{T_start:.4f}, {T_maturity:.4f}].")
+
+        # Calculate elapsed seconds from the absolute start for each data point
+        stock_elapsed_seconds = np.array([(t - t_start).total_seconds() for t in stock_dt])
+        option_elapsed_seconds = np.array([(t - t_start).total_seconds() for t in option_dt])
+
+        # Map the elapsed time to the new [T_start, T_maturity] scale
+        stock_time_scaled = T_start + (stock_elapsed_seconds / seconds_in_year)
+        option_time_scaled = T_start + (option_elapsed_seconds / seconds_in_year)
+
+        # Downsample
+        logging.info(f"Downsampling data: selecting every {self.config.sample_every}-th point.")
+
+        stock_time_scaled = stock_time_scaled[::self.config.sample_every]
+        stock_mid = stock_mid[::self.config.sample_every]
+        option_time_scaled = option_time_scaled[::self.config.sample_every]
+        option_mid = option_mid[::self.config.sample_every]
+
+        return stock_time_scaled, stock_mid, option_time_scaled, option_mid
 
     def _split_data(self, stock_time, stock_mid, option_time, option_mid):
         """Splits the data into unhidden (visible) and hidden sets."""
@@ -193,7 +219,7 @@ class DataLoader:
         plt.plot(hidden_data["T_PATH_U"], hidden_data["U_PATH"], label='Hidden Option Price',
                  color='purple', alpha=0.5, linestyle='--')
 
-        plt.xlabel("Time (seconds from start)")
+        plt.xlabel("Time (maturity is the last data point)")
         plt.ylabel("Mid Price")
         plt.title("Visible and Hidden Data for AAPL Stock and Options", fontsize=16)
         plt.grid(True, linestyle='--', alpha=0.6)
@@ -224,7 +250,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="APPL",
+        default="AAPL",
         help="Config file name in config/loaders/ (without .yaml extension)"
     )
     parser.add_argument(

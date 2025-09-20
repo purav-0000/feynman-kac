@@ -25,3 +25,8 @@ w_data: 1.0
 w_physics: 1.0
 w_l1: 0.0001 # 1e-4
 display_every: 100
+
+# Generation
+n_steps: 50000
+n_paths: 100
+assumed_R: 0.1

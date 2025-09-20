@@ -58,8 +58,7 @@ def load_model_and_xi(model_dir, device):
 
     # Re-create the model architecture
     # Lb and ub can be dynamically modified by the script using the model itself
-    net_u = NetU(layers=config['layers'], lb=0, ub=0).to(device)
-    net_u = net_u.to(torch.double)
+    net_u = NetU(layers=config['layers'], lb=0, ub=0).to(device=device, dtype=torch.double)
 
     # Load the Saved Weights (state_dict)
     state_dict_path = model_dir / "net_u.pth"

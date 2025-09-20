@@ -76,7 +76,8 @@ def estimate_diffusion_fft(S_path, dS_sq_per_dt, bandwidth=2.5, n_grid=10_000):
     return S_grid, np.sqrt(sigma_sq)
 
 
-def estimate_diffusion_unprocessed(S_path, t_path, time_threshold=5.0, bandwidth=2.5, n_grid=10_000):
+def estimate_diffusion_unprocessed(S_path, t_path, time_threshold=5.0, bandwidth=2.5, n_grid=10_000,
+                                   inputs=None):
     """
     Wrapper to estimate diffusion directly from unprocessed S_path and t_path arrays.
     """
@@ -86,9 +87,10 @@ def estimate_diffusion_unprocessed(S_path, t_path, time_threshold=5.0, bandwidth
     # Step 2: Call the core estimation function with the cleaned data
     S_grid, sigma_on_grid = estimate_diffusion_fft(S_path_clean, dS_sq_per_dt_clean, bandwidth, n_grid)
 
-    sigma_at_each_time = np.interp(S_path, S_grid, sigma_on_grid)
+    # Inputs for cu
+    # sigma_at_each_time = np.interp(S_path, S_grid, sigma_on_grid)
 
-    return sigma_at_each_time
+    return S_grid, sigma_on_grid
 
 
 # --- SINDy MODEL TRAINING ---
