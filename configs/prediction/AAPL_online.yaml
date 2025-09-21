@@ -14,7 +14,7 @@ retrain_evals: 500
 
 # Confidence Interval Control
 calculate_intervals: True
-confidence_level: 0.95
+confidence_level: 0.99
 
 # Data hyperparameters (when updating model)
 N_u: 125000

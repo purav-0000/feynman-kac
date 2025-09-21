@@ -69,6 +69,7 @@ def build_library(S_vals, u_vals, u_S_vals, u_SS_vals):
     library_descriptions = ['u', 'S*u_S', 'S^2*u_SS']
     """
 
+
     # ??? A more realistic library perhaps
     library = [
         torch.ones_like(u_vals),  # Constant
@@ -82,5 +83,33 @@ def build_library(S_vals, u_vals, u_S_vals, u_SS_vals):
         'u*u_S', 'S*u_S', 'u^2*u_S', 'S^2*u_S',
         'u*u_SS', 'S*u_SS', 'u^2*u_SS', 'S^2*u_SS'
     ]
+
+    """
+    # More terms for real data?
+    library = [
+        torch.ones_like(u_vals),  # Constant
+        u_vals, S_vals, u_S_vals, u_SS_vals,
+        u_vals * u_S_vals, S_vals * u_S_vals, u_vals ** 2 * u_S_vals, S_vals ** 2 * u_S_vals,
+        u_vals * u_SS_vals, S_vals * u_SS_vals, u_vals ** 2 * u_SS_vals, S_vals ** 2 * u_SS_vals,
+
+        # Derivative mixup
+        u_S_vals * u_S_vals, u_S_vals * u_SS_vals, u_SS_vals * u_SS_vals,
+
+        # Polynomials
+        S_vals ** 2, u_vals ** 2, u_S_vals ** 2, u_SS_vals ** 2,
+    ]
+    library_descriptions = [
+        '1',
+        'u', 'S', 'u_S', 'u_SS',
+        'u*u_S', 'S*u_S', 'u^2*u_S', 'S^2*u_S',
+        'u*u_SS', 'S*u_SS', 'u^2*u_SS', 'S^2*u_SS'
+        
+        # Derivative mixup
+        "u_S^2", "u_S*u_SS", "u_SS^2",
+
+        # Polynomials
+        "S^2", "u^2", "u_S^2", "u_SS^2",
+    ]
+    """
 
     return torch.cat(library, dim=1), library_descriptions

@@ -98,13 +98,11 @@ class PINNTrainer:
         # When experimenting
         # self._load_models()
 
-
         # Check derivatives if using Black-Scholes model
         if self.config.data_dir == "black_scholes_simulated_data":
             self._check_derivatives()
         else:
             self._evaluate_on_test_data()
-
 
         # SINDy step
         self._sindy_eq()
@@ -254,7 +252,7 @@ class PINNTrainer:
             assumed_R=assumed_R,
             uniform_t=self.config.uniform_t,
             trim_percent=None,
-            save_dir_Brownian=self.output_dir
+            save_dir=self.output_dir
         )
         sindy_model.print(lhs=["dY"])
 
@@ -273,8 +271,6 @@ class PINNTrainer:
         )
         sindy_model.print(lhs=["dY"])
         """
-
-
     def _get_current_derivatives(self):
         x_path = np.hstack((self.s_train.reshape(-1, 1), self.t_train.reshape(-1, 1)))
         u_pred, u_t_pred, u_S_pred, u_SS_pred = self.net_u.get_derivatives(
@@ -346,7 +342,7 @@ class PINNTrainer:
         """Loads the pre-trained neural network and xi parameter."""
         logging.info(f"Loading pre-trained model")
 
-        self.net_u, self.xi = load_model_and_xi("models" / Path("AAPL_sample"), self.device)
+        self.net_u, self.xi = load_model_and_xi("models" / Path("AAPL_one"), self.device)
 
         # Initialize model bounds
         S_min, S_max = self.s_train.min(), self.s_train.max()

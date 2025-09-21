@@ -373,7 +373,7 @@ class OnlinePredictor:
             # Step 2: Predict the next `num_steps` using the current SINDy model
             # If there is a time skip after this point, ignore
             if self.config.calculate_intervals:
-                if self.t_total[current_idx + 1] - self.t_history[-1] <= dt:
+                if (self.t_total[current_idx + 1] - self.t_total[current_idx]) <= dt + 1e-7:
                     predictions = self._predict_intervals(sindy_model, np.mean(recovered_dB), bounds)
 
                     # Returns mean, lower bound, upper bound
@@ -479,7 +479,7 @@ class OnlinePredictor:
         while current_idx < self.num_unhidden - 1 + (n_steps - 1):
             all_stocks[:, i] = forward_SDE(all_stocks[:, i - 1])
             all_time[:, i] = all_time[:, i - 1] + self.dt
-            """
+
             # Generate theta matrix for options prediction
             inputs = np.hstack((all_stocks[:, i - 1].reshape(-1, 1), all_time[:, i - 1].reshape(-1, 1)))
             inputs_t = torch.from_numpy(inputs).double().to(self.device).requires_grad_(True)
@@ -502,14 +502,15 @@ class OnlinePredictor:
                 u_theta = np.append(all_options[j, i - 1], 0)
 
                 theta_matrix, _, _ = prepare_theta_matrix(
-                    s_theta, u_theta, u_t_pred[j], u_s_pred[j], u_ss_pred[j], np.random.choice(recovered_dB), self.dt, trim_percent=None
+                    s_theta, u_theta, u_t_pred[j], u_s_pred[j], u_ss_pred[j], np.random.choice(recovered_dB), self.dt,
+                    trim_percent=None
                 )
 
                 coeffs = sindy_model.coefficients()[0]
                 increments = theta_matrix @ coeffs
 
                 all_options[j, i] = all_options[j, i - 1] + increments.item()
-            """
+
             # Update counter
             i += 1
             current_idx += 1
@@ -519,7 +520,7 @@ class OnlinePredictor:
 
         # --- 3. Plotting Phase ---
         # Create the time axis for the generated paths
-        t_generated = self.t_history[-1] + np.arange(n_steps) * self.dt
+        t_generated = all_time[0]
 
         self._plot_generated_paths(
             time_generated=t_generated,
@@ -531,35 +532,27 @@ class OnlinePredictor:
         return t_generated, all_stocks, all_options
 
     def save_results_plot(self, t_path, true_u_path, predicted_u_path, lower_path, upper_path):
-        """Saves a plot comparing the ground truth and predicted option price paths."""
-        logging.info("Saving final results plot...")
+        """Saves a publication-ready plot comparing ground truth and prediction, with a zoom-in inset."""
+        logging.info("Saving final results plot with inset zoom...")
 
-        save_dir = "models" / Path(self.config.model_dir)
-        save_dir.mkdir(exist_ok=True) # Ensure the directory exists
+        save_dir = Path("models") / Path(self.config.model_dir)
+        save_dir.mkdir(exist_ok=True)
         save_path = save_dir / "online_prediction_vs_truth.png"
 
-        plt.figure(figsize=(15, 7))
-
-        # Forcing limits for now
-        # plt.ylim(59.0, 62.0)
+        # --- Main Plot Setup ---
+        fig, ax = plt.subplots(figsize=(15, 8))
 
         # Plot the full ground truth path
-        plt.plot(t_path[self.num_unhidden - 1:], true_u_path[self.num_unhidden - 1:], label='Ground Truth', color='black', linewidth=2, zorder=2)
+        ax.plot(t_path[self.num_unhidden - 1:], true_u_path[self.num_unhidden - 1:], label='Ground Truth',
+                color='black', linewidth=2, zorder=2)
 
-        """
-        # Plot the initial history that the prediction starts with (solid red)
-        plt.plot(t_path[:self.num_unhidden], predicted_u_path[:self.num_unhidden],
-                 label='Prediction (Known History)', color='red', linewidth=2, zorder=3)
-        """
-
-        # Plot the newly predicted points with a different style (dashed red)
-        # We start from num_unhidden-1 to create a continuous line
-        plt.plot(t_path[self.num_unhidden - 1:], predicted_u_path[self.num_unhidden - 1:],
-                 label='Prediction (Online)', color='red', linestyle='--', linewidth=2.5, zorder=3)
+        # Plot the newly predicted points with a thinner line
+        ax.plot(t_path[self.num_unhidden - 1:], predicted_u_path[self.num_unhidden - 1:],
+                label='Prediction (Online)', color='red', linestyle='--', linewidth=2.0, zorder=3)
 
         # Plot the confidence interval as a shaded region
         if self.config.calculate_intervals:
-            plt.fill_between(
+            ax.fill_between(
                 t_path[self.num_unhidden - 1:],
                 lower_path[self.num_unhidden - 1:],
                 upper_path[self.num_unhidden - 1:],
@@ -569,15 +562,61 @@ class OnlinePredictor:
             )
 
         # Add a vertical line to mark where the prediction begins
-        plt.axvline(x=t_path[self.num_unhidden - 1], color='gray', linestyle=':',
-                    label='Prediction Start', zorder=1)
+        ax.axvline(x=t_path[self.num_unhidden - 1], color='gray', linestyle=':',
+                   label='Prediction Start', zorder=1)
 
-        plt.title('Online Prediction of Option Price vs. Ground Truth', fontsize=16)
-        plt.xlabel('Time (t)', fontsize=12)
-        plt.ylabel('Option Price (u)', fontsize=12)
-        plt.legend()
-        plt.grid(True, linestyle=':')
+        # --- Inset Plot (Zoom-in) ---
+        # Position: [left, bottom, width, height] -> moved to bottom right
+        axins = ax.inset_axes([0.65, 0.15, 0.3, 0.28])
+
+        # Define a smaller zoom region for a more detailed view
+        zoom_start_t, zoom_end_t = 0.95595, 0.95600
+
+        # Create masks to select data for the zoom
+        valid_range_mask = t_path >= t_path[self.num_unhidden - 1]
+        zoom_mask = (t_path >= zoom_start_t) & (t_path <= zoom_end_t) & valid_range_mask
+
+        # If the default zoom region has no data, create a new one from the last 100 points
+        if not np.any(zoom_mask):
+            logging.warning(f"Default zoom range [{zoom_start_t}, {zoom_end_t}] is empty. Selecting last 100 points.")
+            end_index = len(t_path)
+            start_index = max(self.num_unhidden - 1, end_index - 100)
+
+            zoom_mask = np.zeros_like(t_path, dtype=bool)
+            zoom_mask[start_index:end_index] = True
+
+            zoom_start_t = t_path[start_index]
+            zoom_end_t = t_path[end_index - 1]
+
+        # Plot the same data but for the zoomed region on the inset axes
+        axins.plot(t_path[zoom_mask], true_u_path[zoom_mask], color='black', linewidth=1.5)
+        axins.plot(t_path[zoom_mask], predicted_u_path[zoom_mask], color='red', linestyle='--', linewidth=2.0)
+        if self.config.calculate_intervals:
+            axins.fill_between(t_path[zoom_mask], lower_path[zoom_mask], upper_path[zoom_mask],
+                               color='red', alpha=0.2)
+
+        # Set the limits and labels for the inset plot
+        axins.set_xlim(zoom_start_t, zoom_end_t)
+        y_min_inset = min(np.min(lower_path[zoom_mask]), np.min(true_u_path[zoom_mask]))
+        y_max_inset = max(np.max(upper_path[zoom_mask]), np.max(true_u_path[zoom_mask]))
+        y_padding = (y_max_inset - y_min_inset) * 0.1
+        axins.set_ylim(y_min_inset - y_padding, y_max_inset + y_padding)
+        axins.set_title(f"Zoom in (t={zoom_start_t:.2f}-{zoom_end_t:.2f})")
+        axins.grid(True, linestyle=':')
+
+        # Draw a box indicating the zoom area on the main plot
+        ax.indicate_inset_zoom(axins, edgecolor="black")
+
+        # --- Final Touches for Main Plot ---
+        ax.set_title('Online Prediction of Option Price vs. Ground Truth', fontsize=16)
+        ax.set_xlabel('Time (t)', fontsize=12)
+        ax.set_ylabel('Option Price (u)', fontsize=12)
+        ax.legend(loc='upper left')
+        ax.grid(True, linestyle=':')
+
+        plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
 
         logging.info(f"Plot saved successfully to {save_path}")
 
@@ -673,14 +712,14 @@ def main():
 
     predictor = OnlinePredictor(config)
 
-    """
+
     if config.calculate_intervals:
         t, u_true, u_pred, lb, ub = predictor.predict()
         predictor.save_results_plot(t, u_true, u_pred, lb, ub)
     else:
         t, u_true, u_pred = predictor.predict()
         predictor.save_results_plot(t, u_true, u_pred, None, None)
-    """
+
 
     predictor.generate_paths(n_steps=config.n_steps, n_paths=config.n_paths, assumed_R=config.assumed_R)
 

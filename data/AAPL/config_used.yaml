@@ -1,8 +1,8 @@
 input_stock_path: data/AAPL/aapl_stock.csv
 input_options_path: data/AAPL/aapl_options.csv
 output_dir_name: AAPL
-num_points_to_use: 500000
-sample_every: 5
-num_unhidden_points: 400000
+num_points_to_use: 300000
+sample_every: 10
+num_unhidden_points: 250000
 maturity_time: 1
 seed: 42
