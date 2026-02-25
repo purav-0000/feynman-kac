@@ -110,7 +110,7 @@ class DataGenerator:
             "T_PATH": t_path[:n_unhidden],
             "S_PATH": s_path[:n_unhidden],
             "U_PATH": u_path[:n_unhidden],
-            "DB": db_path[:n_unhidden - 1]  # Last dB point is not utilized in any calculation
+            "DB": db_path[:n_unhidden - 1]  # There is no dB for the last point
         }
         hidden_data = {
             "T_PATH": t_path[n_unhidden:],

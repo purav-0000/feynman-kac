@@ -38,14 +38,15 @@ def apply_overrides(cfg: typing.Any, overrides: typing.List[str]):
             # If there's a comma, treat it as a list. Otherwise, a scalar.
             if ',' in val_str:
                 # Find the list type within the Union, e.g., List[float]
-                list_type = next((t for t in get_args(target_type) if get_origin(t) is list), None)
+                list_type = next((t for t in get_args(target_type) if get_origin(t) is (list, typing.List)), None)
                 if list_type:
                     # Get the list's element type (e.g., float) and cast each part
                     element_type = get_args(list_type)[0]
                     processed_val = [element_type(v.strip()) for v in val_str.split(',')]
             else:
                 # Find the scalar type within the Union
-                scalar_type = next((t for t in get_args(target_type) if get_origin(t) is not list), None)
+                scalar_type = next((t for t in get_args(target_type) if get_origin(t) not in (list, typing.List)
+                                    and t is not type(None)), None)
                 if scalar_type:
                     # Cast the whole string to the scalar type
                     processed_val = scalar_type(val_str)

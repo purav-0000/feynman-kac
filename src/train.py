@@ -1,4 +1,5 @@
 import argparse
+import copy
 import logging
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -13,11 +14,12 @@ import torch
 import yaml
 
 from src.utils.common import apply_overrides
+from src.utils.interval import get_conformal_sindy_intervals, get_ensemble_sindy_intervals
 from src.utils.data_processing import prepare_dataset_for_model, build_library
 from src.utils.model import load_model_and_xi, prepare_model
 from src.utils.sigma_estimation import estimate_constant_sigma, estimate_diffusion_unprocessed
-from src.utils.sindy import discover_equation, extract_brownian, prepare_theta_matrix
-from src.utils.training import make_closure
+from src.utils.sindy import discover_equation, extract_brownian, get_sindy_mask, prepare_theta_matrix
+from src.utils.training import make_closure, make_sindy_loss_closure
 from src.utils.true_greeks import black_scholes_partial_t, black_scholes_partial_x, black_scholes_partial_xx
 
 
@@ -41,16 +43,22 @@ class Config:
     # Loss weights
     w_data: float = 1.0
     w_physics: float = 1.0
+    w_sindy: float = 1e+6
     w_l1: float = 0.0
 
     # Optimizer
     max_eval: int = 3_000
+    max_eval_FT: int = 3_00
     patience: int = 3
 
     display_every: int = 100
+    output_dir: str = "black-scholes"  # Saves to this directory when training, when testing, loads from this directory
 
     # Reproducibility
     seed: int = 42
+
+    # Execution mode
+    mode: str = "train"  # Options: 'train', 'test'
 
 
 def load_config(path: str) -> Config:
@@ -74,13 +82,28 @@ class PINNTrainer:
         # Load and process data
         self.s_train, self.t_train, self.u_train = self._load_data()
 
-        # Use normalized data for training
-        self.x_u_train_t, self.x_f_train_t, self.u_train_t = prepare_dataset_for_model(
-            self.config.N_u, self.config.N_f, self.s_train, self.t_train, self.u_train, self.device
-        )
+        # Do different stuffs based on passed execution mode
+        if self.config.mode == "train":
+            # Create NEW timestamped directory
+            self.output_dir = Path("models") / self.config.output_dir
+            self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Prepare model and optimizer
-        self.net_u, self.xi, self.optimizer = self._prepare_model_and_optimizer()
+            # Prepare data for training
+            self.x_u_train_t, self.x_f_train_t, self.u_train_t = prepare_dataset_for_model(
+                self.config.N_u, self.config.N_f, self.s_train, self.t_train, self.u_train, self.device
+            )
+
+            # Initialize fresh model and optimizer
+            self.net_u, self.xi, self.optimizer = self._prepare_model_and_optimizer()
+
+        else:  # Mode == "test"
+            # Point to existing directory
+            self.output_dir = Path("models") / self.config.output_dir
+            if not self.output_dir.exists():
+                raise FileNotFoundError(f"Cannot test: Model directory {self.output_dir} does not exist.")
+
+            # Load existing model
+            self._load_models()
 
         # Get config file used for generation from data directory
         # This gives us paramters like strike price, rate, etc. to calculate analytic derivatives
@@ -88,15 +111,14 @@ class PINNTrainer:
             with open("data" / Path(self.config.data_dir) / "config_used.yaml", "r") as file:
                 self.bs_data_config = yaml.safe_load(file)
 
-        self.output_dir = Path("models") / f"run_{int(time())}"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
     def run(self):
         """Main execution method to start the training process."""
-        # Train the model
-        self._train_model()
-        # When experimenting
-        # self._load_models()
+        if self.config.mode == "train":
+            logging.info("--- Starting Training Run ---")
+            self._train_model()
+            self._save_artifacts()  # Only save artifacts if we actually trained
+        else:
+            logging.info(f"--- Starting Test Run (Model: {self.config.output_dir}) ---")
 
         # Check derivatives if using Black-Scholes model
         if self.config.data_dir == "black_scholes_simulated_data":
@@ -105,10 +127,17 @@ class PINNTrainer:
             self._evaluate_on_test_data()
 
         # SINDy step
-        self._sindy_eq()
+        sindy_model = self._sindy_eq()
 
-        # Save artifacts
-        self._save_artifacts()
+        mask = get_sindy_mask(sindy_model)
+        logging.info(f"SINDy Mask found: {mask}")
+
+        # 3. Fine-Tune the Neural Network
+        # logging.info("--- Starting Fine-Tuning (SINDy Projection Loss) ---")
+        # self._fine_tune_model(mask)
+
+        # 4. Uncertainty Quantification
+        # self._quantify_uncertainty()
 
     def _load_data(self) -> (np.ndarray, np.ndarray, np.ndarray):
         """Loads the training data from the .npz file specified in the config."""
@@ -177,7 +206,53 @@ class PINNTrainer:
         duration = time() - start_time
         logging.info(f"L-BFGS training finished in {duration:.2f} seconds.")
 
-    def _check_derivatives(self):
+    def _fine_tune_model(self, mask):
+
+        # 1. Data Prep
+        s_tensor = torch.from_numpy(self.s_train).double().to(self.device)
+        t_tensor = torch.from_numpy(self.t_train).double().to(self.device)
+        u_tensor = torch.from_numpy(self.u_train).double().to(self.device)
+
+        # Calculate dt and dB
+        dt = np.min(np.diff(self.t_train))
+        sigma_est = estimate_constant_sigma(self.s_train, dt)
+        assumed_R = self.bs_data_config['R']
+        recovered_dB_np = extract_brownian(assumed_R, self.s_train, sigma_est, dt)
+        recovered_dB_tensor = torch.from_numpy(recovered_dB_np).double().to(self.device)
+
+        # 2. Generate SHARED Indices (Crucial for Warm Start)
+        # We generate the batch ONCE so both optimizers see the exact same landscape.
+        N_samples = len(recovered_dB_tensor)
+        BATCH_SIZE = 22500
+        fixed_indices = torch.randperm(N_samples, device=self.device)[:BATCH_SIZE]
+
+        # Initialize L-BFGS (inherits weights modified by Adam)
+        optimizer_lbfgs = torch.optim.LBFGS(
+            list(self.net_u.parameters()),
+            max_iter=10_000,
+            max_eval=self.config.max_eval_FT,
+            tolerance_grad=np.finfo(float).eps,
+            tolerance_change=np.finfo(float).eps,
+            history_size=50,
+            line_search_fn="strong_wolfe"
+        )
+
+        # Create NEW Closure for L-BFGS
+        # Must recreate because closure captures the specific 'optimizer' instance
+        # But we pass the SAME fixed_indices
+        closure_lbfgs = make_sindy_loss_closure(
+            self.net_u, optimizer_lbfgs, s_tensor, t_tensor, u_tensor,
+            recovered_dB_tensor, dt, assumed_R, sigma_est, mask, self.config, fixed_indices=fixed_indices
+        )
+
+        # Run L-BFGS
+        optimizer_lbfgs.step(closure_lbfgs)
+
+        logging.info("Fine-tuning complete.")
+
+        self._check_derivatives(fine_tuning=True)
+
+    def _check_derivatives(self, fine_tuning=False):
         """ Compare derivatives of model and analytic derivatives on a plot """
         logging.info("Generating derivative comparison plot...")
 
@@ -188,7 +263,6 @@ class PINNTrainer:
         u_t_pred = u_t_pred.cpu().detach().numpy()
         u_S_pred = u_S_pred.cpu().detach().numpy()
         u_SS_pred = u_SS_pred.cpu().detach().numpy()
-
 
         time_to_maturity = self.bs_data_config['T'] - self.t_train
         actual_theta = black_scholes_partial_t(
@@ -204,30 +278,43 @@ class PINNTrainer:
             self.bs_data_config['SIGMA_VAL']
         )
 
-        fig, axs = plt.subplots(nrows=4, ncols=1, figsize=(12, 18), sharex=True)
-        fig.suptitle("Comparison of Model Derivatives and Analytical Greeks", fontsize=16)
+        # --- UPDATED PLOTTING LOGIC ---
+        # We create 2 columns: Left = Value, Right = Error
+        fig, axs = plt.subplots(nrows=4, ncols=2, figsize=(18, 18), sharex='col')
+        fig.suptitle("Model Derivatives vs Truth (Left) and Error Residuals (Right)", fontsize=16)
 
         plot_data = [
-            ("u (Option Price)", self.u_train, u_pred),
-            ("u_t (Theta)", actual_theta, u_t_pred),
-            ("u_S (Delta)", actual_delta, u_S_pred),
-            ("u_SS (Gamma)", actual_gamma, u_SS_pred)
+            ("Option Price (u)", self.u_train, u_pred),
+            ("Theta (u_t)", actual_theta, u_t_pred),
+            ("Delta (u_S)", actual_delta, u_S_pred),
+            ("Gamma (u_SS)", actual_gamma, u_SS_pred)
         ]
 
         for i, (title, truth, pred) in enumerate(plot_data):
-            axs[i].plot(self.t_train, truth, label="Ground Truth (Analytical)", color='black', linestyle='--')
-            axs[i].plot(self.t_train, pred, label="Model Prediction", color='red', alpha=0.7)
-            axs[i].set_title(title)
-            axs[i].grid(True, linestyle=':')
-            axs[i].legend()
+            # Left Col: The Values
+            axs[i, 0].plot(self.t_train, truth, 'k--', label="Truth")
+            axs[i, 0].plot(self.t_train, pred, 'r', alpha=0.7, label="Pred")
+            axs[i, 0].set_title(title)
+            axs[i, 0].grid(True, linestyle=':')
+            if i == 0: axs[i, 0].legend()
 
-        plt.xlabel("Time (t)")
+            # Right Col: The Error (Truth - Pred)
+            error = truth - pred.flatten()
+            axs[i, 1].plot(self.t_train, error, 'b', linewidth=1)
+            axs[i, 1].set_title(f"Error in {title}")
+            axs[i, 1].grid(True, linestyle=':')
+
+            # Add Mean Absolute Error annotation
+            mae = np.mean(np.abs(error))
+            axs[i, 1].text(0.05, 0.9, f"MAE: {mae:.2e}", transform=axs[i, 1].transAxes,
+                           bbox=dict(facecolor='white', alpha=0.8))
+
         plt.tight_layout(rect=[0, 0.03, 1, 0.97])
 
-        save_path = self.output_dir / "derivatives_comparison.png"
+        filename = "updated_derivatives_error.png" if fine_tuning else "derivatives_error.png"
+        save_path = self.output_dir / filename
         plt.savefig(save_path)
-        logging.info(f"Saved derivative plot to {save_path}")
-
+        logging.info(f"Saved derivative error plot to {save_path}")
         plt.close(fig)
 
     def _sindy_eq(self):
@@ -240,6 +327,23 @@ class PINNTrainer:
             assumed_R = self.bs_data_config['R']
         else:
             assumed_R = 0.1
+
+        time_to_maturity = self.bs_data_config['T'] - self.t_train
+        actual_theta = black_scholes_partial_t(
+            self.s_train, self.bs_data_config['K'], time_to_maturity, self.bs_data_config['R'],
+            self.bs_data_config['SIGMA_VAL']
+        )
+        actual_delta = black_scholes_partial_x(
+            self.s_train, self.bs_data_config['K'], time_to_maturity, self.bs_data_config['R'],
+            self.bs_data_config['SIGMA_VAL']
+        )
+        actual_gamma = black_scholes_partial_xx(
+            self.s_train, self.bs_data_config['K'], time_to_maturity, self.bs_data_config['R'],
+            self.bs_data_config['SIGMA_VAL']
+        )
+        u_t_pred = torch.tensor(actual_theta)
+        u_s_pred = torch.tensor(actual_delta)
+        u_ss_pred = torch.tensor(actual_gamma)
 
         # 1. With no trimming
         logging.info("Equation with no trimming")
@@ -271,6 +375,48 @@ class PINNTrainer:
         )
         sindy_model.print(lhs=["dY"])
         """
+        return sindy_model
+
+    def _quantify_uncertainty(self):
+        logging.info("--- Starting Uncertainty Quantification (E-SINDy) ---")
+
+        u_pred, u_t_pred, u_s_pred, u_ss_pred = self._get_current_derivatives()
+
+        # If Black-Scholes simulated data, set simulated R to what was actually used in the simulation
+        if self.config.data_dir == "black_scholes_simulated_data":
+            assumed_R = self.bs_data_config['R']
+        else:
+            assumed_R = 0.1
+
+        time_to_maturity = self.bs_data_config['T'] - self.t_train
+        actual_theta = black_scholes_partial_t(
+            self.s_train, self.bs_data_config['K'], time_to_maturity, self.bs_data_config['R'],
+            self.bs_data_config['SIGMA_VAL']
+        )
+        actual_delta = black_scholes_partial_x(
+            self.s_train, self.bs_data_config['K'], time_to_maturity, self.bs_data_config['R'],
+            self.bs_data_config['SIGMA_VAL']
+        )
+        actual_gamma = black_scholes_partial_xx(
+            self.s_train, self.bs_data_config['K'], time_to_maturity, self.bs_data_config['R'],
+            self.bs_data_config['SIGMA_VAL']
+        )
+        u_t_pred = torch.tensor(actual_theta)
+        u_s_pred = torch.tensor(actual_delta)
+        u_ss_pred = torch.tensor(actual_gamma)
+
+
+        # Run E-SINDy
+        xi_median, xi_lower, xi_upper, _ = get_ensemble_sindy_intervals(
+            s_train=self.s_train,
+            t_train=self.t_train,
+            u_train=self.u_train,
+            derivatives=(u_pred, u_t_pred, u_s_pred, u_ss_pred),
+            assumed_R=assumed_R,
+            uniform_t=self.config.uniform_t,
+            n_bootstraps=100
+        )
+
     def _get_current_derivatives(self):
         x_path = np.hstack((self.s_train.reshape(-1, 1), self.t_train.reshape(-1, 1)))
         u_pred, u_t_pred, u_S_pred, u_SS_pred = self.net_u.get_derivatives(
@@ -340,21 +486,53 @@ class PINNTrainer:
     # --- METHODS NEEDED WHEN EXPERIMENTING ---
     def _load_models(self):
         """Loads the pre-trained neural network and xi parameter."""
-        logging.info(f"Loading pre-trained model")
+        logging.info(f"Loading pre-trained model from: {self.output_dir}")
 
-        self.net_u, self.xi = load_model_and_xi("models" / Path("AAPL_one"), self.device)
+        # Load using the output_dir determined in __init__
+        self.net_u, self.xi = load_model_and_xi(self.output_dir, self.device)
 
-        # Initialize model bounds
-        S_min, S_max = self.s_train.min(), self.s_train.max()
-        t_min, t_max = self.t_train.min(), self.t_train.max()
+    """
+    def _quantify_uncertainty_torch(self, mask):
+        logging.info("--- Starting Uncertainty Quantification (E-SINDy) ---")
 
-        # For normalization
-        lb = torch.tensor([S_min, t_min], device=self.device, dtype=torch.double)
-        ub = torch.tensor([S_max, t_max], device=self.device, dtype=torch.double)
+        # Get Estimates
+        dt = np.min(np.diff(self.t_train))
+        sigma_est = estimate_constant_sigma(self.s_train, dt)
 
-        self.net_u.lower_bound = lb
-        self.net_u.upper_bound = ub
+        # Prepare Data Tensors
+        s_tensor = torch.from_numpy(self.s_train).double().to(self.device)
+        t_tensor = torch.from_numpy(self.t_train).double().to(self.device)
+        u_tensor = torch.from_numpy(self.u_train).double().to(self.device)
 
+        assumed_R = self.bs_data_config['R']
+        recovered_dB_np = extract_brownian(assumed_R, self.s_train, sigma_est, dt)
+        recovered_dB_tensor = torch.from_numpy(recovered_dB_np).double().to(self.device)
+
+        # Run E-SINDy
+        xi_median, xi_lower, xi_upper = get_ensemble_sindy_intervals(
+            net_u=self.net_u,
+            s_train=s_tensor,
+            t_train=t_tensor,
+            u_train=u_tensor,
+            recovered_dB=recovered_dB_tensor,
+            dt=dt,
+            mask_indices=mask,
+            cfg=self.config,
+            n_bootstraps=100
+        )
+
+        # Display Results
+        print("\n=== E-SINDy 90% Confidence Intervals ===")
+        print("Coefficients (Median [Lower, Upper]):")
+
+        # We need to map these back to the names?
+        # For now, just print the active ones
+        for i, c in enumerate(xi_median):
+            print(f"  Term {i}: {c:.4f}  [ {xi_lower[i]:.4f}, {xi_upper[i]:.4f} ]")
+
+        # Optional: Check if 1.0 is inside the intervals
+        # Ideally, we want [0.99, 1.01]
+    """
 
 # --- Main Entry Point ---
 

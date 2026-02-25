@@ -7,8 +7,8 @@ class NetU(nn.Module):
 
     def __init__(self, layers, lb, ub):
         super(NetU, self).__init__()
-        self.lower_bound = lb
-        self.upper_bound = ub
+        self.register_buffer("lower_bound", lb)
+        self.register_buffer("upper_bound", ub)
         modules = []
         for i in range(len(layers) - 2):
             modules.append(nn.Linear(layers[i], layers[i+1]))
@@ -56,9 +56,13 @@ def load_model_and_xi(model_dir, device):
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
+    # load_state_dict will handle overwriting these
+    dummy_lb = torch.zeros(2)
+    dummy_ub = torch.ones(2)
+
     # Re-create the model architecture
     # Lb and ub can be dynamically modified by the script using the model itself
-    net_u = NetU(layers=config['layers'], lb=0, ub=0).to(device=device, dtype=torch.double)
+    net_u = NetU(layers=config['layers'], lb=dummy_lb, ub=dummy_ub).to(device=device, dtype=torch.double)
 
     # Load the Saved Weights (state_dict)
     state_dict_path = model_dir / "net_u.pth"

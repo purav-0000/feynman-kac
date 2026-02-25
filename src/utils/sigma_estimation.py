@@ -38,13 +38,11 @@ def prepare_data(S_path, t_path, time_threshold=5.0):
 
     valid_indices = np.where(dt <= time_threshold)[0]
 
-    num_total = len(dt)
-    num_valid = len(valid_indices)
-
     S_path_filtered = S_path[valid_indices]
     dS_filtered = dS[valid_indices]
     dt_filtered = dt[valid_indices]
     dS_sq_per_dt = dS_filtered ** 2 / dt_filtered
+
 
     return S_path_filtered, dS_sq_per_dt
 
@@ -87,7 +85,7 @@ def estimate_diffusion_unprocessed(S_path, t_path, time_threshold=5.0, bandwidth
     # Step 2: Call the core estimation function with the cleaned data
     S_grid, sigma_on_grid = estimate_diffusion_fft(S_path_clean, dS_sq_per_dt_clean, bandwidth, n_grid)
 
-    # Inputs for cu
+    # Don't know why this exists
     # sigma_at_each_time = np.interp(S_path, S_grid, sigma_on_grid)
 
     return S_grid, sigma_on_grid

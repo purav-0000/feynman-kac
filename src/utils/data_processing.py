@@ -69,7 +69,6 @@ def build_library(S_vals, u_vals, u_S_vals, u_SS_vals):
     library_descriptions = ['u', 'S*u_S', 'S^2*u_SS']
     """
 
-
     # ??? A more realistic library perhaps
     library = [
         torch.ones_like(u_vals),  # Constant

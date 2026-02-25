@@ -1,0 +1,24 @@
+N_f: 100000
+N_u: 350000
+data_dir: black_scholes_simulated_data
+display_every: 100
+layers:
+- 2
+- 32
+- 32
+- 32
+- 32
+- 32
+- 32
+- 1
+max_eval: 1500
+max_eval_FT: 300
+mode: train
+output_dir: test1
+patience: 3
+seed: 42
+uniform_t: true
+w_data: 1.0
+w_l1: 1.0e-05
+w_physics: 1.0
+w_sindy: 1000000

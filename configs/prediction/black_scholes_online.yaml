@@ -13,7 +13,7 @@ nn_update_every: 20000  # Number of steps before retraining the neural network.
 retrain_evals: 500
 
 # Confidence Interval Control
-calculate_intervals: True
+calculate_intervals: False
 confidence_level: 0.99
 
 # Data hyperparameters (when updating model)
@@ -25,3 +25,8 @@ w_data: 1.0
 w_physics: 1.0
 w_l1: 0.0
 display_every: 100
+
+# Generation
+n_steps: 50000
+n_paths: 100
+assumed_R: 0.1

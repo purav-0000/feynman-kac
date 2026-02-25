@@ -13,10 +13,16 @@ layers: [2, 32, 32, 32, 32, 32, 32, 1]  # If passed as override, enter as 2,32,3
 # Loss function weights
 w_data: 1.0
 w_physics: 1.0
+w_sindy: 1000000 # 1e+6
 w_l1: 0.00001 # 1e-5
 
 # Optimizer
 max_eval: 3_000
+max_eval_FT: 3_00
 patience: 3
 
 display_every: 100
+output_dir: "black-scholes"  # Saves to this directory when training, when testing, loads from this directory
+
+# Execution mode
+mode: "train"  # Options: 'train', 'test'

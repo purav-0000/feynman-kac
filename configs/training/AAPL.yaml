@@ -13,10 +13,12 @@ layers: [2, 32, 32, 32, 32, 32, 32, 1]  # If passed as override, enter as 2,32,3
 # Loss function weights
 w_data: 1.0
 w_physics: 1.0
+w_sindy: 1000000 #1e+6
 w_l1: 0.0001 # 1e-4
 
 # Optimizer
 max_eval: 3_000
+max_eval_FT: 3_00
 patience: 3
 
 display_every: 100

@@ -11,13 +11,13 @@ import torch
 import yaml
 from tqdm import tqdm
 
-# Assuming your utility functions are structured like this
 from src.utils.common import apply_overrides
 from src.utils.data_processing import prepare_dataset_for_model
 from src.utils.model import load_model_and_xi
 from src.utils.sigma_estimation import estimate_constant_sigma, estimate_diffusion_unprocessed
 from src.utils.sindy import discover_equation, extract_brownian, prepare_theta_matrix
 from src.utils.training import make_closure
+from src.utils.true_greeks import black_scholes_partial_t, black_scholes_partial_x, black_scholes_partial_xx
 
 
 # --- Configuration ---
@@ -138,19 +138,13 @@ class OnlinePredictor:
 
         u_pred, u_t_pred, u_s_pred, u_ss_pred = self.net_u.get_derivatives(inputs_t)
 
-        # If Black-Scholes simulated data, set simulated R to what was actually used in the simulation
-        if self.config.data_dir == "black_scholes_simulated_data":
-            assumed_R = self.bs_data_config['R']
-        else:
-            assumed_R = 0.1
-
         # Discover equation
         sindy_model = discover_equation(
             s_path=self.s_history,
             u_path=self.u_history,
             t_path=self.t_history,
             derivatives=(u_pred, u_t_pred, u_s_pred, u_ss_pred),
-            assumed_R=assumed_R,
+            assumed_R=self.config.assumed_R,
             uniform_t=self.config.uniform_t,
             trim_percent=None
         )
@@ -172,7 +166,8 @@ class OnlinePredictor:
         u_pred, u_t_pred, u_s_pred, u_ss_pred = self.net_u.get_derivatives(inputs_t)
 
         sigma_est = estimate_constant_sigma(self.s_history, self.dt)  # Use sigma from history
-        recovered_dB = extract_brownian(assumed_r=self.bs_data_config['R'], S_path=s_for_db,
+
+        recovered_dB = extract_brownian(assumed_r=self.config.assumed_R, S_path=s_for_db,
                                         sigma_estimate=sigma_est, dt=self.dt)
 
         # !!! NOTE: prepare_theta_matrix usually discards last value of each array. This is because it assumes
@@ -185,6 +180,24 @@ class OnlinePredictor:
         u_t_pred = torch.cat([u_t_pred, zero_array])
         u_s_pred = torch.cat([u_s_pred, zero_array])
         u_ss_pred = torch.cat([u_ss_pred, zero_array])
+
+        # Analytic derivatives
+        """
+        time_to_maturity = self.bs_data_config['T'] - t_future
+        u_t_pred = black_scholes_partial_t(s_future[:-1], self.bs_data_config['K'], time_to_maturity,
+                                           self.bs_data_config['R'], sigma_est)
+        u_t_pred = np.append(u_t_pred, 0)
+        u_s_pred = black_scholes_partial_x(s_future[:-1], self.bs_data_config['K'], time_to_maturity,
+                                           self.bs_data_config['R'], sigma_est)
+        u_s_pred = np.append(u_s_pred, 0)
+        u_ss_pred = black_scholes_partial_xx(s_future[:-1], self.bs_data_config['K'], time_to_maturity,
+                                           self.bs_data_config['R'], sigma_est)
+        u_ss_pred = np.append(u_ss_pred, 0)
+
+        u_t_pred = torch.from_numpy(u_t_pred.reshape(-1, 1)).to(self.device)
+        u_s_pred = torch.from_numpy(u_s_pred.reshape(-1, 1)).to(self.device)
+        u_ss_pred = torch.from_numpy(u_ss_pred.reshape(-1, 1)).to(self.device)
+        """
 
         # u_pred is passed but not utilized
         theta_matrix, _, _ = prepare_theta_matrix(
@@ -204,6 +217,7 @@ class OnlinePredictor:
         inputs_t = torch.from_numpy(inputs).double().to(self.device).requires_grad_(True)
 
         u_pred, u_t_pred, u_s_pred, u_ss_pred = self.net_u.get_derivatives(inputs_t)
+
 
         # !!! NOTE: prepare_theta_matrix usually discards last value of each array. This is because it assumes
         # that recovered Brownian motion is always one less (which it is if we extract Brownian for the entire
@@ -348,17 +362,20 @@ class OnlinePredictor:
             # Step 1: Discover/update the SINDy model only when scheduled
             if sindy_model is None or steps_since_last_sindy_update >= self.config.sindy_update_every:
                 sindy_model = self._discover_equation()
-
                 # Cache Brownian motion
-                s_grid, sigma_on_grid = estimate_diffusion_unprocessed(self.s_history, self.t_history,
-                                                                       time_threshold=self.dt)
-                sigma_est = np.interp(self.s_history, s_grid, sigma_on_grid)
-                assumed_R = 0.1
-                recovered_dB = extract_brownian(assumed_R, self.s_history, sigma_est, self.dt)
+                if self.config.uniform_t:
+                    sigma_est = estimate_constant_sigma(self.s_history, self.dt)
+                    recovered_dB = extract_brownian(self.config.assumed_R, self.s_history, sigma_est, dt)
 
-                # Apply mask that get rid of big time jumps
-                valid_indices = np.where(np.diff(self.t_history) <= self.dt)[0]
-                recovered_dB = recovered_dB[valid_indices]
+                else:
+                    s_grid, sigma_on_grid = estimate_diffusion_unprocessed(self.s_history, self.t_history,
+                                                                           time_threshold=self.dt)
+                    sigma_est = np.interp(self.s_history, s_grid, sigma_on_grid)
+                    recovered_dB = extract_brownian(self.config.assumed_R, self.s_history, sigma_est, self.dt)
+
+                    # Apply mask that get rid of big time jumps
+                    valid_indices = np.where(np.diff(self.t_history) <= self.dt)[0]
+                    recovered_dB = recovered_dB[valid_indices]
 
                 # Calculate the lower and upper percentiles required for the confidence interval
                 alpha = 1 - self.config.confidence_level  # e.g., 1 - 0.95 = 0.05
@@ -422,7 +439,7 @@ class OnlinePredictor:
 
         return self.t_total, self.u_total, np.array(predicted_u_path[:len(self.t_total)])
 
-    def generate_paths(self, n_steps=10_000, n_paths=1000, assumed_R=0.1):
+    def generate_paths(self, n_steps=10_000, n_paths=1000):
         "Generates paths by sampling from the observed Brownian increments"
 
         # This is necessary if you've commented out predict
@@ -431,44 +448,46 @@ class OnlinePredictor:
 
         # Learn the volatility function sigma(S) from historical data
         logging.info("Learning the volatility function sigma(S) from historical data...")
-        s_grid, sigma_on_grid = estimate_diffusion_unprocessed(self.s_history, self.t_history)
 
-        # Create a simple, callable interpolation function for the diffusion term
-        get_diffusion_term = lambda s: np.interp(s, s_grid, sigma_on_grid)
+        if not self.config.uniform_t:
+            s_grid, sigma_on_grid = estimate_diffusion_unprocessed(self.s_history, self.t_history)
 
-        # Recover historical Brownian increments for sampling
-        # (This part would be the same as in your previous 'predict' function)
-        sigma_est = get_diffusion_term(self.s_history)
-        recovered_dB = extract_brownian(assumed_R, self.s_history, sigma_est, self.dt)
+            # Create a simple, callable interpolation function for the diffusion term
+            get_diffusion_term = lambda s: np.interp(s, s_grid, sigma_on_grid)
 
-        # Apply mask that get rid of big time jumps
-        valid_indices = np.where(np.diff(self.t_history) <= self.dt)[0]
-        recovered_dB = recovered_dB[valid_indices]
+            # Recover historical Brownian increments for sampling
+            # (This part would be the same as in your previous 'predict' function)
+            sigma_est = get_diffusion_term(self.s_history)
+            recovered_dB = extract_brownian(self.config.assumed_R, self.s_history, sigma_est, self.dt)
+
+            # Apply mask that get rid of big time jumps
+            valid_indices = np.where(np.diff(self.t_history) <= self.dt)[0]
+            recovered_dB = recovered_dB[valid_indices]
+        else:
+            sigma_est = estimate_constant_sigma(self.s_history, self.dt)
+            get_diffusion_term = lambda s: sigma_est * s
+            recovered_dB = extract_brownian(self.config.assumed_R, self.s_history, sigma_est, self.dt)
 
         # Discover equation
         sindy_model = self._discover_equation()
 
-        def forward_SDE(S):
+        def forward_SDE(S, dB_samples):
             "Take the stock one step forward in time"
             # Get the state-dependent diffusion term for the *current* stock price
             diffusion_val = get_diffusion_term(S)
 
-            # Sample an increment from the historical distribution
-            db_sample = np.random.choice(recovered_dB, len(S))
-
             # Apply the SDE formula: dS = r*S*dt + (sigma_func)*dB
-            dS = assumed_R * S * self.dt + diffusion_val * db_sample
-
+            dS = self.config.assumed_R * S * self.dt + diffusion_val * dB_samples
             return S + dS
 
-        all_stocks = np.zeros((n_paths, n_steps))
+        all_stocks = np.zeros((n_paths, n_steps + 1))
         all_stocks[:, 0] = self.s_history[-1]
 
-        all_options = np.zeros((n_paths, n_steps))
+        all_options = np.zeros((n_paths, n_steps + 1))
         all_options[:, 0] = self.u_history[-1]
 
         # Time array could be 1D but 2D allows for easy NN batching
-        all_time = np.zeros((n_paths, n_steps))
+        all_time = np.zeros((n_paths, n_steps + 1))
         all_time[:, 0] = self.t_history[-1]
 
         current_idx = self.num_unhidden - 1
@@ -476,9 +495,22 @@ class OnlinePredictor:
         # Now we generate
         i = 1
         self.pbar = tqdm(total=n_steps, desc="Generation")
-        while current_idx < self.num_unhidden - 1 + (n_steps - 1):
-            all_stocks[:, i] = forward_SDE(all_stocks[:, i - 1])
+        while current_idx < self.num_unhidden - 1 + n_steps:
+
+            # Sample Brownian for both stock and option for all paths
+            dB_samples = np.random.choice(recovered_dB, n_paths)
+            # dB_samples = np.random.normal(loc=0, scale=np.sqrt(self.dt), size=n_paths)
+
+            all_stocks[:, i] = forward_SDE(all_stocks[:, i - 1], dB_samples)
+
+            # Time skip logic
+            if i == 1:
+                all_time[:, i] = all_time[:, i - 1] + 2_500 * self.dt
+            else:
+                all_time[:, i] = all_time[:, i - 1] + self.dt
+
             all_time[:, i] = all_time[:, i - 1] + self.dt
+
 
             # Generate theta matrix for options prediction
             inputs = np.hstack((all_stocks[:, i - 1].reshape(-1, 1), all_time[:, i - 1].reshape(-1, 1)))
@@ -492,6 +524,7 @@ class OnlinePredictor:
             u_s_pred = torch.cat([u_s_pred, zero_array], dim=1)
             u_ss_pred = torch.cat([u_ss_pred, zero_array], dim=1)
 
+
             # Unfortunate for loop because prepare_theta_matrix does not handle 2D arrays
             for j in range(n_paths):
                 # !!! NOTE: prepare_theta_matrix usually discards last value of each array. This is because it assumes
@@ -501,8 +534,33 @@ class OnlinePredictor:
                 s_theta = np.append(all_stocks[j, i - 1], 0)
                 u_theta = np.append(all_options[j, i - 1], 0)
 
+                """
+                s_future = s_theta
+                t_future = all_time[0, i - 1]
+                time_to_maturity = self.bs_data_config['T'] - t_future
+                u_t_pred = black_scholes_partial_t(s_future[:-1], self.bs_data_config['K'], time_to_maturity,
+                                                   self.bs_data_config['R'], sigma_est)
+                u_t_pred = np.append(u_t_pred, 0)
+                u_s_pred = black_scholes_partial_x(s_future[:-1], self.bs_data_config['K'], time_to_maturity,
+                                                   self.bs_data_config['R'], sigma_est)
+                u_s_pred = np.append(u_s_pred, 0)
+                u_ss_pred = black_scholes_partial_xx(s_future[:-1], self.bs_data_config['K'], time_to_maturity,
+                                                     self.bs_data_config['R'], sigma_est)
+                u_ss_pred = np.append(u_ss_pred, 0)
+
+                u_t_pred = torch.from_numpy(u_t_pred.reshape(-1, 1)).to(self.device)
+                u_s_pred = torch.from_numpy(u_s_pred.reshape(-1, 1)).to(self.device)
+                u_ss_pred = torch.from_numpy(u_ss_pred.reshape(-1, 1)).to(self.device)
+                
+
                 theta_matrix, _, _ = prepare_theta_matrix(
-                    s_theta, u_theta, u_t_pred[j], u_s_pred[j], u_ss_pred[j], np.random.choice(recovered_dB), self.dt,
+                    s_theta, u_theta, u_t_pred, u_s_pred, u_ss_pred, dB_samples[j], self.dt,
+                    trim_percent=None
+                )
+                """
+
+                theta_matrix, _, _ = prepare_theta_matrix(
+                    s_theta, u_theta, u_t_pred[j], u_s_pred[j], u_ss_pred[j], dB_samples[j], self.dt,
                     trim_percent=None
                 )
 
@@ -565,6 +623,7 @@ class OnlinePredictor:
         ax.axvline(x=t_path[self.num_unhidden - 1], color='gray', linestyle=':',
                    label='Prediction Start', zorder=1)
 
+        """
         # --- Inset Plot (Zoom-in) ---
         # Position: [left, bottom, width, height] -> moved to bottom right
         axins = ax.inset_axes([0.65, 0.15, 0.3, 0.28])
@@ -606,7 +665,7 @@ class OnlinePredictor:
 
         # Draw a box indicating the zoom area on the main plot
         ax.indicate_inset_zoom(axins, edgecolor="black")
-
+        """
         # --- Final Touches for Main Plot ---
         ax.set_title('Online Prediction of Option Price vs. Ground Truth', fontsize=16)
         ax.set_xlabel('Time (t)', fontsize=12)
@@ -634,7 +693,7 @@ class OnlinePredictor:
 
         # --- 2. Limit the amount of history shown ---
         num_generated_steps = options_generated.shape[1]
-        history_to_show = min(len(self.t_history), num_generated_steps)
+        history_to_show = min(len(self.t_history), 4 * num_generated_steps)
         hist_start_idx = len(self.t_history) - history_to_show
 
         time_hist_sliced = self.t_history[hist_start_idx:]
@@ -682,6 +741,18 @@ class OnlinePredictor:
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust layout to make room for suptitle
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
 
+        data_save_path = save_dir / "generated_paths_data.npz"
+        np.savez_compressed(
+            data_save_path,
+            time_generated=time_generated,
+            options_generated=options_generated,
+            stocks_generated=stocks_generated,
+            time_hist_sliced=self.t_history,
+            stock_hist_sliced=self.s_history,
+            option_hist_sliced=self.u_history,
+            simulation_start_time=simulation_start_time
+        )
+
         logging.info(f"Plot saved successfully to {save_path}")
 
 
@@ -712,16 +783,32 @@ def main():
 
     predictor = OnlinePredictor(config)
 
-
+    """
     if config.calculate_intervals:
         t, u_true, u_pred, lb, ub = predictor.predict()
+
+        # 2. Define the output filename
+        filename = "prediction_outputs.npz"
+
+        # 3. Save the specific arrays you need
+        np.savez(
+            Path("models") / Path("AAPL_ten") / filename,
+            t=t,
+            u_true=u_true,
+            predictions=u_pred,
+            lower_bounds=lb,
+            upper_bounds=ub
+        )
+
+        print(f"Arrays saved successfully to {filename}")
+
         predictor.save_results_plot(t, u_true, u_pred, lb, ub)
     else:
         t, u_true, u_pred = predictor.predict()
         predictor.save_results_plot(t, u_true, u_pred, None, None)
+    """
 
-
-    predictor.generate_paths(n_steps=config.n_steps, n_paths=config.n_paths, assumed_R=config.assumed_R)
+    predictor.generate_paths(n_steps=config.n_steps, n_paths=config.n_paths)
 
 
 if __name__ == "__main__":

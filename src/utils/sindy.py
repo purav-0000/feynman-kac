@@ -4,8 +4,31 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pysindy as ps
+from sklearn.linear_model import LinearRegression
+import torch
 
 from src.utils.sigma_estimation import estimate_constant_sigma, estimate_diffusion_unprocessed
+
+
+def get_sindy_mask(sindy_model, threshold=1e-5):
+    """
+    Extracts a boolean mask of active terms from a trained SINDy model.
+
+    Returns:
+        torch.Tensor: A boolean tensor of shape (n_features,) where True
+                      indicates the term has a non-zero coefficient.
+    """
+    # coefficients() returns shape (n_targets, n_features).
+    # For a single equation (dY), we take the first row [0].
+    coeffs = sindy_model.coefficients()[0]
+
+    # Create boolean mask
+    # SINDy probably already applies a threshold and sets many terms to 0 but we still use a small number just to be
+    # safe
+    active_indices = np.abs(coeffs) > threshold
+
+    # Return as a simple boolean list or tensor for easy indexing later
+    return active_indices
 
 
 def extract_brownian(assumed_r, S_path, sigma_estimate, dt):
@@ -50,7 +73,8 @@ def save_updated_brownian(recovered_dB, dt, model_dir):
     plt.close()
 
 
-def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovered_dB, dt, trim_percent=None):
+def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovered_dB, dt, assumed_R, sigma_est,
+                         trim_percent=None):
 
     # To numpy and flatten
     u_path_sindy = u_path.flatten()
@@ -87,15 +111,79 @@ def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovere
     rate_term = S_path_sindy * u_s_sindy
     f_candidate_terms_matrix = np.vstack([
         u_t_sindy,
-        rate_term,
-        S_path_sindy ** 2 * u_ss_sindy,
+        assumed_R * rate_term,
+        (sigma_est ** 2) * (S_path_sindy ** 2) * u_ss_sindy,
     ]).T
     Z_candidate_terms_matrix = np.vstack([
-        S_path_sindy * u_s_sindy
+        sigma_est * S_path_sindy * u_s_sindy,
     ]).T
-    f_candidate_feature_names = ["u_t", "X * u_x", "X^2 * u_xx"]
-    Z_candidate_feature_names = ["X * u_x"]
+    f_candidate_feature_names = ["u_t", "r * X * u_x", "sigma^2 * X^2 * u_xx"]
+    Z_candidate_feature_names = ["sigma * X * u_x"]
     """
+
+    # --- (Not) Black-Scholes specific library ---
+    # --- 1. Drift Candidates (dt terms) ---
+    # Intrinsic Units required: [Currency] / [Time]
+    # When multiplied by dt [Time], the result is [Currency].
+
+    f_candidate_terms_matrix = np.vstack([
+        # --- A. Standard Black-Scholes Terms ---
+        u_t_sindy,  # Time Decay (Theta)
+        assumed_R * S_path_sindy * u_s_sindy,  # Drift (Rate · Delta)
+        (sigma_est ** 2) * (S_path_sindy ** 2) * u_ss_sindy,  # Ito Correction (Vol² · Gamma)
+
+        # --- B. Variance & Mean Reversion ---
+        # (sigma_est ** 2) * S_path_sindy,  # Variance Bias (Vol² · S)
+        # assumed_R * u_path_sindy,  # Mean Reversion (Rate · u)
+
+        # --- C. Nonlinear / Distress Terms ---
+        (sigma_est ** 2) * (u_path_sindy ** 2) / S_path_sindy,  # Inverse Price / Distress
+
+        # --- D. Higher Order Interactions ---
+        # Interaction: Rate x Convexity
+        assumed_R * (S_path_sindy ** 2) * u_ss_sindy,  # Rate-Gamma Cross
+
+        # Interaction: Hedging Flow (Delta x Gamma)
+        # Note: Must divide by S to maintain units of [Currency]/[Time]
+        # Unit Check: [1/T] * [C] * [1] * [C]^2 * [1/C] / [C] = [C]/[T] (Correct)
+        (sigma_est ** 2) * S_path_sindy * u_s_sindy * (S_path_sindy ** 2) * u_ss_sindy / S_path_sindy
+    ]).T
+
+    f_candidate_feature_names = [
+        "u_t",  # Time evolution
+        "r·S·u_x",  # Delta drift
+        "σ²·S²·u_xx",  # Ito/Gamma
+        # "σ²·S",  # Linear Variance  # STRUGGLES WITH THIS TERM
+        # "r·u",  # Mean Reversion  # IT ALWAYS GETS THIS TERM
+        "σ²·u²/S",  # Inverse/Distress
+        "r·S²·u_xx",  # Rate-Gamma Cross  # HIGHLY CORRELATED TERM
+        "σ²·S²·u_x·u_xx"  # Delta-Gamma Interaction
+    ]
+
+    # --- 2. Diffusion Candidates (dB terms) ---
+    # Intrinsic Units required: [Currency] / [Root-Time]
+    # When multiplied by dB [Root-Time], the result is [Currency].
+
+    Z_candidate_terms_matrix = np.vstack([
+        # --- A. Standard Black-Scholes Diffusion ---
+        sigma_est * S_path_sindy * u_s_sindy,  # Geometric Vol (Vol · Delta)
+
+        # --- B. Alternative Volatility Models ---
+        sigma_est * S_path_sindy,  # Bachelier / Normal Vol
+        sigma_est * u_path_sindy,  # Value-Proportional Vol
+
+        # --- C. Nonlinear Noise ---
+        sigma_est * (S_path_sindy ** 2) * u_ss_sindy,  # Gamma-Driven Noise
+        sigma_est * (u_path_sindy ** 2) / S_path_sindy  # Inverse/Distress Noise
+    ]).T
+
+    Z_candidate_feature_names = [
+        "σ·S·u_x",  # Standard Diffusion
+        "σ·S",  # Constant Vol
+        "σ·u",  # Value-Proportional
+        "σ·S²·u_xx",  # Gamma-Driven
+        "σ·u²/S"  # Inverse/Distress
+    ]
 
     """
     # --- Slightly more flexible library (SINDy test) ---
@@ -116,7 +204,6 @@ def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovere
     ]).T
     f_candidate_feature_names = ["u_t", "X * u_x", "X^2 * u_xx", "X^3", "u^2", "X * u^2"]
     Z_candidate_feature_names = ["X * u_x", "X", "u"]
-    """
 
 
     # --- Flexible Library ---
@@ -147,8 +234,6 @@ def prepare_theta_matrix(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovere
         "u"
     ]
 
-
-    """
     # --- Extremely Flexible Library ---
     # Candidate terms for the drift part, f(t, X, u, u_x, u_xx)
     epsilon = 1e-8
@@ -281,6 +366,7 @@ def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, unifor
     # Else make other assumptions
     if uniform_t:
         dt = t_path[1] - t_path[0]
+
         sigma_est = estimate_constant_sigma(s_path, dt)
         recovered_dB = extract_brownian(assumed_R, s_path, sigma_est, dt)
 
@@ -297,7 +383,7 @@ def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, unifor
         t_sindy = t_path
 
     theta_matrix, dy, feature_names = prepare_theta_matrix(
-        s_path, u_path, u_t_pred, u_s_pred, u_ss_pred, recovered_dB, dt, trim_percent=trim_percent
+        s_path, u_path, u_t_pred, u_s_pred, u_ss_pred, recovered_dB, dt, assumed_R, sigma_est, trim_percent=trim_percent
     )
 
     # Manually trim t_path
@@ -320,9 +406,9 @@ def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, unifor
     if save_dir is not None:
         save_updated_brownian(recovered_dB, dt, save_dir)
 
-    optimizer_lin_reg = ps.STLSQ(threshold=0, alpha=0, normalize_columns=True)
-    optimizer_STLSQ = ps.STLSQ(threshold=1e-3, alpha=5e+2, normalize_columns=True)
-    optimizer_SR3 = ps.SR3(reg_weight_lam=1e+1, regularizer='L2', max_iter=1000, normalize_columns=True)
+    optimizer_lin_reg = ps.STLSQ(threshold=0, alpha=0, normalize_columns=False, max_iter=1)
+    optimizer_STLSQ = ps.STLSQ(threshold=5e-2, alpha=0, normalize_columns=True)
+    optimizer_SR3 = ps.SR3(reg_weight_lam=0.5, regularizer='L2', normalize_columns=True)
 
     sindy_model = ps.SINDy(
         optimizer=optimizer_STLSQ,
@@ -339,12 +425,13 @@ def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, unifor
     sindy_model.fit(theta_matrix, x_dot=dy.reshape(-1, 1), t=t_sindy, feature_names=feature_names)
 
     # Score for debugging
-    print(sindy_model.score(x=theta_matrix, x_dot=dy.reshape(-1, 1), t=t_sindy))
+    logging.info(f"SINDy score (R^2): {sindy_model.score(x=theta_matrix, x_dot=dy.reshape(-1, 1), t=t_sindy)}")
 
-    sindy_model.print(lhs=["dY"])
+    # Equation for debugging
+    # sindy_model.print(lhs=["dY"])
 
-    # Plot for debugging
-    if save_dir is not None:
+    # Plot for debugging if not Black Scholes
+    if save_dir is not None and not isinstance(t_sindy, float):
         plt.figure(figsize=(16, 8))
         plt.plot(t_sindy, dy, label="dY")
         plt.plot(t_sindy, sindy_model.predict(theta_matrix), label="predicted dY")
@@ -354,3 +441,125 @@ def discover_equation(s_path, u_path, t_path, derivatives, assumed_R=0.1, unifor
         plt.close()
 
     return sindy_model
+
+
+def build_sindy_library_torch(S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovered_dB, dt, assumed_R, sigma_est):
+    """
+    PyTorch implementation of the prepare_theta_matrix library to enable differentiability.
+    Constructs the matrix Theta such that dY ~ Theta @ xi
+
+    Args:
+        S_path, u_path, u_t_pred, u_S_pred, u_SS_pred, recovered_dB, dt: Tensors of shape (N, 1) or (N,)
+        recovered_dB: Tensor of shape (N, 1) or (N,) representing Brownian increments
+        dt: float or scalar Tensor
+
+    Returns:
+        Theta: Tensor of shape (N, n_features)
+    """
+    """
+    # PERFECT LIBRARY
+    # Ensure shapes are compatible (flatten to column vectors)
+    S = S_path.reshape(-1, 1)
+    u = u_path.reshape(-1, 1)
+    u_t = u_t_pred.reshape(-1, 1)
+    u_S_pred = u_S_pred.reshape(-1, 1)
+    u_SS_pred = u_SS_pred.reshape(-1, 1)
+    recovered_dB = recovered_dB.reshape(-1, 1)
+
+    # --- 1. Drift Candidate Library (f) ---
+    # Matches: [u_t, X * u_x, X^2 * u_xx]
+    f_term_1 = u_t
+    f_term_2 = S * u_S_pred
+    f_term_3 = (S ** 2) * u_SS_pred
+
+    f_matrix = torch.cat([f_term_1, f_term_2, f_term_3], dim=1)
+
+    # --- 2. Diffusion Candidate Library (Z) ---
+    # Matches: [X * u_x]
+    z_term_1 = S * u_S_pred
+
+    z_matrix = z_term_1  # Shape (N, 1)
+
+    # --- 3. Construct Theta ---
+    # Theta = [dt * f, dB * Z]
+    # Structure: dY = f*dt + Z*dB
+
+    Theta = torch.cat([
+        dt * f_matrix,
+        recovered_dB * z_matrix
+    ], dim=1)
+    """
+    # Ensure shapes are compatible (flatten to column vectors)
+    S = S_path.reshape(-1, 1)
+    u = u_path.reshape(-1, 1)
+    u_t = u_t_pred.reshape(-1, 1)
+    u_S = u_S_pred.reshape(-1, 1)
+    u_SS = u_SS_pred.reshape(-1, 1)
+    dB = recovered_dB.reshape(-1, 1)
+
+    # --- 1. Drift Candidate Library (f) ---
+    # Intrinsic Units: [Currency] / [Time]
+    # When multiplied by dt, result is [Currency]
+
+    # Term 1: Time Decay (Theta)
+    f_term_1 = u_t
+
+    # Term 2: Linear Drift (Rate * Delta * S)
+    f_term_2 = assumed_R * S * u_S
+
+    # Term 3: Convexity / Ito Correction (0.5 * Vol^2 * Gamma * S^2)
+    f_term_3 = 0.5 * (sigma_est ** 2) * (S ** 2) * u_SS
+
+    # Term 4: Variance Bias (Vol^2 * S)
+    f_term_4 = (sigma_est ** 2) * S
+
+    # Term 5: Mean Reversion (Rate * u)
+    f_term_5 = assumed_R * u
+
+    # Term 6: Inverse Price / Distress (Vol^2 * u^2 / S)
+    f_term_6 = (sigma_est ** 2) * (u ** 2) / (S + 1e-6)  # Added epsilon for stability
+
+    # Term 7: Rate-Gamma Cross (Rate * Gamma * S^2)
+    f_term_7 = assumed_R * (S ** 2) * u_SS
+
+    f_matrix = torch.cat([
+        f_term_1, f_term_2, f_term_3,
+        f_term_4, f_term_5, f_term_6, f_term_7
+    ], dim=1)
+
+    # --- 2. Diffusion Candidate Library (Z) ---
+    # Intrinsic Units: [Currency] / [Root-Time]
+    # When multiplied by dB, result is [Currency]
+
+    # Term 1: Geometric Brownian Motion (Vol * Delta * S)
+    z_term_1 = sigma_est * S * u_S
+
+    # Term 2: Bachelier / Normal Vol (Vol * S)
+    z_term_2 = sigma_est * S
+
+    # Term 3: Value-Proportional Vol (Vol * u)
+    z_term_3 = sigma_est * u
+
+    # Term 4: Gamma-Driven Noise (Vol * Gamma * S^2)
+    z_term_4 = sigma_est * (S ** 2) * u_SS
+
+    # Term 5: Inverse Price Noise (Vol * u^2 / S)
+    z_term_5 = sigma_est * (u ** 2) / (S + 1e-6)
+
+    z_matrix = torch.cat([
+        z_term_1, z_term_2, z_term_3,
+        z_term_4, z_term_5
+    ], dim=1)
+
+    # --- 3. Construct Theta ---
+    # Theta = [dt * f, dB * Z]
+    # Note: We must broadcast dB against the Z matrix columns
+
+    Theta = torch.cat([
+        dt * f_matrix,
+        dB * z_matrix
+    ], dim=1)
+
+    return Theta
+
+    return Theta
