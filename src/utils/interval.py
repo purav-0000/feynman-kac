@@ -4,14 +4,15 @@ import logging
 
 import pysindy as ps
 
-from src.utils.sindy import build_sindy_library_torch, discover_equation, estimate_constant_sigma, extract_brownian
+from src.utils.dataclasses import DerivativeData, PathData, SINDyContext
+from src.utils.sigma_estimation import estimate_diffusion_unprocessed
+from src.utils.sindy import build_theta_matrix, estimate_constant_sigma, extract_brownian, run_sindy
 
 
 def get_ensemble_sindy_intervals(
-        s_train, t_train, u_train,
-        derivatives,
-        assumed_R,
-        uniform_t,
+        paths: PathData,
+        derivs: DerivativeData,
+        ctx: SINDyContext,
         n_bootstraps=100,
         sample_ratio=0.9,
         alpha=0.1
@@ -21,118 +22,37 @@ def get_ensemble_sindy_intervals(
     and Target (dY), and then bootstrapping the rows.
     """
 
-    # Unpack and convert to numpy flattened arrays for easy matrix math
-    u_pred, u_t_pred, u_s_pred, u_ss_pred = derivatives
+    # 1. Estimate global variables and Brownian motion
+    # If t is uniform, then make certain assumptions about sigma and Brownian motion
+    # Else make other assumptions
+    if ctx.uniform_t:
+        ctx.dt = paths.t[1] - paths.t[0]
+        ctx.sigma_est = estimate_constant_sigma(paths.s, ctx.dt)
+        ctx.recovered_dB = extract_brownian(ctx.assumed_R, paths.s, ctx.sigma_est, ctx.dt)
+    else:
+        ctx.dt = min(np.diff(paths.t))
 
-    s_full = s_train.flatten()
-    u_full = u_train.flatten()
-    u_t_full = u_t_pred.cpu().detach().numpy().flatten()
-    u_s_full = u_s_pred.cpu().detach().numpy().flatten()
-    u_ss_full = u_ss_pred.cpu().detach().numpy().flatten()
-    t_full = t_train.flatten()
+        # Time threshold gets rid of points just before a time skip in the dataset
+        # Necessary for better estimation of Brownian
+        s_grid, sigma_on_grid = estimate_diffusion_unprocessed(paths.s, paths.t, time_threshold=ctx.dt)
+        ctx.sigma_est = np.interp(paths.s, s_grid, sigma_on_grid)
+        ctx.recovered_dB = extract_brownian(ctx.assumed_R, paths.s, ctx.sigma_est, ctx.dt)
 
-    # 1. Global Calculations
-    dt = t_full[1] - t_full[0]
-
-    # Calculate target (dY) globally
-    dY_full = np.diff(u_full)
-
-    # Estimate constants and Brownian motion globally
-    sigma_est = estimate_constant_sigma(s_full, dt)
-    recovered_dB = extract_brownian(assumed_R, s_full, sigma_est, dt)
-
-    # --- IMPORTANT TRIMMING ---
-    # dY and recovered_dB are size N-1.
-    # We must trim the last element of all other arrays to match sizes.
-    s_trim = s_full[:-1]
-    u_trim = u_full[:-1]
-    u_t_trim = u_t_full[:-1]
-    u_s_trim = u_s_full[:-1]
-    u_ss_trim = u_ss_full[:-1]
+        # We trim the last element because build_theta_matrix does that for every function
+        ctx.sigma_est = ctx.sigma_est[:-1]
 
     # 2. Global Library Construction (Theta Matrix)
-    # Using the Black-Scholes specific library from your code
-    rate_term = s_trim * u_s_trim
+    # Unpack and convert to numpy flattened arrays for easy matrix math
+    Theta_full, dY_full, feature_names = build_theta_matrix(
+        paths, derivs, ctx, return_tensors=False
+    )
 
-    # --- (Not) Black-Scholes specific library ---
-    # --- 1. Drift Candidates (dt terms) ---
-    # Intrinsic Units required: [Currency] / [Time]
-    # When multiplied by dt [Time], the result is [Currency].
+    if not ctx.uniform_t:
+        t_path = paths.t[:-1]
+        valid_indices = np.where(np.diff(t_path) <= ctx.dt)[0]
+        Theta_full = Theta_full[valid_indices, :]
+        dY_full = dY_full[valid_indices]
 
-    f_candidate_terms_matrix = np.vstack([
-        # --- A. Standard Black-Scholes Terms ---
-        u_t_trim,  # Time Decay (Theta)
-        assumed_R * s_trim * u_s_trim,  # Drift (Rate · Delta)
-        (sigma_est ** 2) * (s_trim ** 2) * u_ss_trim,  # Ito Correction (Vol² · Gamma)
-
-        # --- B. Variance & Mean Reversion ---
-        (sigma_est ** 2) * s_trim,  # Variance Bias (Vol² · S)
-        # assumed_R * u_path_sindy,  # Mean Reversion (Rate · u)
-
-        # --- C. Nonlinear / Distress Terms ---
-        (sigma_est ** 2) * (u_trim ** 2) / s_trim,  # Inverse Price / Distress
-
-        # --- D. Higher Order Interactions ---
-        # Interaction: Rate x Convexity
-        # assumed_R * (S_path_sindy ** 2) * u_ss_sindy,  # Rate-Gamma Cross
-
-        # Interaction: Hedging Flow (Delta x Gamma)
-        # Note: Must divide by S to maintain units of [Currency]/[Time]
-        # Unit Check: [1/T] * [C] * [1] * [C]^2 * [1/C] / [C] = [C]/[T] (Correct)
-        (sigma_est ** 2) * s_trim * u_s_trim * (s_trim ** 2) * u_ss_trim / s_trim
-    ]).T
-
-    f_candidate_feature_names = [
-        "u_t",  # Time evolution
-        "r·S·u_x",  # Delta drift
-        "σ²·S²·u_xx",  # Ito/Gamma
-        "σ²·S",  # Linear Variance  # STRUGGLES WITH THIS TERM
-        # "r·u",  # Mean Reversion  # IT ALWAYS GETS THIS TERM
-        "σ²·u²/S",  # Inverse/Distress
-        # "r·S²·u_xx",  # Rate-Gamma Cross  # HIGHLY CORRELATED TERM
-        "σ²·S²·u_x·u_xx"  # Delta-Gamma Interaction
-    ]
-
-    # --- 2. Diffusion Candidates (dB terms) ---
-    # Intrinsic Units required: [Currency] / [Root-Time]
-    # When multiplied by dB [Root-Time], the result is [Currency].
-
-    Z_candidate_terms_matrix = np.vstack([
-        # --- A. Standard Black-Scholes Diffusion ---
-        sigma_est * s_trim * u_s_trim,  # Geometric Vol (Vol · Delta)
-
-        # --- B. Alternative Volatility Models ---
-        sigma_est * s_trim,  # Bachelier / Normal Vol
-        sigma_est * u_trim,  # Value-Proportional Vol
-
-        # --- C. Nonlinear Noise ---
-        sigma_est * (s_trim ** 2) * u_ss_trim,  # Gamma-Driven Noise
-        sigma_est * (u_trim ** 2) / s_trim  # Inverse/Distress Noise
-    ]).T
-
-    Z_candidate_feature_names = [
-        "σ·S·u_x",  # Standard Diffusion
-        "σ·S",  # Constant Vol
-        "σ·u",  # Value-Proportional
-        "σ·S²·u_xx",  # Gamma-Driven
-        "σ·u²/S"  # Inverse/Distress
-    ]
-
-    # Combine into Theta: dY ≈ dt * f + dB * Z
-    Theta_full = np.hstack([
-        dt * f_candidate_terms_matrix,
-        recovered_dB.reshape(-1, 1) * Z_candidate_terms_matrix
-    ])
-
-    # Conformal CP step
-    # sindy_model_cp = ps.SINDy(
-    #     optimizer=ps.STLSQ(threshold=0, alpha=0, normalize_columns=False, max_iter=1),
-    #     feature_library=ps.IdentityLibrary(),
-    # )
-    # sindy_model_cp.fit(Theta_full, x_dot=dY_full.reshape(-1, 1), t=1.0)
-    # get_conformal_sindy_intervals(Theta_full=Theta_full, dY_full=dY_full, xi_fit=sindy_model_cp.coefficients().flatten())
-
-    feature_names = f_candidate_feature_names + Z_candidate_feature_names
     N_total = len(dY_full)
     n_samples_per_boot = int(N_total * sample_ratio)
 
@@ -140,7 +60,10 @@ def get_ensemble_sindy_intervals(
     max_start_idx = N_total - n_samples_per_boot
 
     optimizer_lin_reg = ps.STLSQ(threshold=0, alpha=0, normalize_columns=False, max_iter=1)
-    optimizer_STLSQ = ps.STLSQ(threshold=5e-4, alpha=0, normalize_columns=True)
+    optimizer_STLSQ_bs = ps.STLSQ(threshold=5e-2, normalize_columns=True)
+    optimizer_STLSQ = ps.STLSQ(threshold=0.05, alpha=0.01, normalize_columns=True)
+    optimizer_SR3 = ps.SR3(reg_weight_lam=0.5, regularizer='L2', normalize_columns=True)
+    optimizer_linreg = ps.STLSQ(threshold=0, alpha=0, normalize_columns=False, max_iter=1)
     ensemble_coefs = []
 
     # 3. Time Block Bootstrap Loop
@@ -161,7 +84,7 @@ def get_ensemble_sindy_intervals(
                 optimizer=optimizer_STLSQ,
                 feature_library=ps.IdentityLibrary(),
             )
-            sindy_model.fit(Theta_boot, x_dot=dY_boot.reshape(-1, 1), t=dt)
+            sindy_model.fit(Theta_boot, x_dot=dY_boot.reshape(-1, 1), t=ctx.dt)
 
             ensemble_coefs.append(sindy_model.coefficients().flatten())
 
@@ -172,8 +95,8 @@ def get_ensemble_sindy_intervals(
     # 4. Aggregate Statistics
     ensemble_np = np.array(ensemble_coefs)  # Shape: (n_bootstraps, n_features)
 
-    # Median
-    xi_median = np.mean(ensemble_np, axis=0)
+    # Median (Updated from np.mean to match your intended logic)
+    xi_median = np.median(ensemble_np, axis=0)
 
     # Confidence Intervals
     lower_bound = np.percentile(ensemble_np, 100 * (alpha / 2), axis=0)
@@ -182,10 +105,11 @@ def get_ensemble_sindy_intervals(
     # Inclusion Probability (ratio of times coefficient was strictly non-zero)
     inclusion_prob = np.count_nonzero(ensemble_np, axis=0) / len(ensemble_np)
 
-    # Optional: Log the results using feature names for clarity
+    # Log the results using feature names for clarity
     for i, name in enumerate(feature_names):
         logging.info(
-            f"{name}: Med={xi_median[i]:.4f}, CI=[{lower_bound[i]:.4f}, {upper_bound[i]:.4f}], Prob={inclusion_prob[i]:.2f}")
+            f"{name}: Med={xi_median[i]:.4f}, CI=[{lower_bound[i]:.4f}, {upper_bound[i]:.4f}], Prob={inclusion_prob[i]:.2f}"
+        )
 
     return xi_median, lower_bound, upper_bound, inclusion_prob
 

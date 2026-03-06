@@ -1,6 +1,7 @@
 # Data options
 data_dir: "black_scholes_simulated_data"
 uniform_t: True
+simulated_black_scholes_data: True
 
 # Data hyperparameters
 N_u: 350000
@@ -20,6 +21,7 @@ w_l1: 0.00001 # 1e-5
 max_eval: 3_000
 max_eval_FT: 3_00
 patience: 3
+subsample_size: 20000
 
 display_every: 100
 output_dir: "black-scholes"  # Saves to this directory when training, when testing, loads from this directory

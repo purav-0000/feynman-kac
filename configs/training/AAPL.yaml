@@ -1,10 +1,11 @@
 # Data options
 data_dir: "AAPL"
 uniform_t: False
+simulated_black_scholes_data: False
 
 # Data hyperparameters
-N_u: 400000
-N_f: 150000
+N_u: 250000
+N_f: 50000
 
 # Model hyperparameters
 layers: [2, 32, 32, 32, 32, 32, 32, 1]  # If passed as override, enter as 2,32,32,32,32,32,32,1
@@ -20,5 +21,10 @@ w_l1: 0.0001 # 1e-4
 max_eval: 3_000
 max_eval_FT: 3_00
 patience: 3
+subsample_size: 20000
 
 display_every: 100
+output_dir: "AAPL"  # Saves to this directory when training, when testing, loads from this directory
+
+# Execution mode
+mode: "train"  # Options: 'train', 'test'

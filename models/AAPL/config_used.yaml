@@ -1,0 +1,26 @@
+N_f: 50000
+N_u: 250000
+data_dir: AAPL
+display_every: 100
+layers:
+- 2
+- 32
+- 32
+- 32
+- 32
+- 32
+- 32
+- 1
+max_eval: 3000
+max_eval_FT: 300
+mode: train
+output_dir: AAPL
+patience: 3
+seed: 42
+simulated_black_scholes_data: false
+subsample_size: 20000
+uniform_t: false
+w_data: 1.0
+w_l1: 0.0001
+w_physics: 1.0
+w_sindy: 1000000
